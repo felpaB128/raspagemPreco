@@ -1,0 +1,11 @@
+{
+    "chat.mcp.access": "all",
+    "chat.mcp.autostart": "newAndOutdated",
+    "chat.mcp.serverSampling": {
+        "Web Scraping Copilot: Web Scraping Copilot": {
+            "allowedModels": [
+                "copilot/gpt-5-mini"
+            ]
+        }
+    }
+}
