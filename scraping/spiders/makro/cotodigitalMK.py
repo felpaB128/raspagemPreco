@@ -2,878 +2,648 @@ import csv
 import json
 import re
 import unicodedata
+from ast import literal_eval
+from difflib import SequenceMatcher
 from pathlib import Path
-from urllib.parse import quote, urljoin
+from urllib.parse import quote
 
-from scrapy import Spider, Request, Selector
-
-try:
-    import openpyxl
-except ImportError:
-    openpyxl = None
+import scrapy
+from openpyxl import load_workbook
 
 
-class CotoDigitalMKSpider(Spider):
+class CotodigitalMkSpider(scrapy.Spider):
     name = "cotodigital_mk"
-    allowed_domains = [
-        "www.cotodigital.com.ar",
-        "cotodigital.com.ar",
-        "api.cotodigital.com.ar",
-    ]
+    allowed_domains = ["api.coto.com.ar", "www.cotodigital.com.ar", "cotodigital.com.ar"]
 
     custom_settings = {
-        "ZYTE_API_TRANSPARENT_MODE": True,
-        "CONCURRENT_REQUESTS_PER_DOMAIN": 4,
-        "DOWNLOAD_DELAY": 0.2,
-        "LOG_LEVEL": "INFO",
+        "ROBOTSTXT_OBEY": False,
+        "DOWNLOAD_DELAY": 0.5,
+        "CONCURRENT_REQUESTS_PER_DOMAIN": 2,
+        "RETRY_TIMES": 2,
+        "DOWNLOAD_TIMEOUT": 30,
         "FEED_EXPORT_ENCODING": "utf-8",
+        "LOG_LEVEL": "INFO",
     }
 
-    # -----------------------------
-    # init
-    # -----------------------------
-    def __init__(
-        self,
-        ean=None,
-        arquivo_entrada=None,
-        termo=None,
-        modo="ambos",
-        *args,
-        **kwargs,
-    ):
+    HEADER_ALIASES = {
+        "articulo nr": "Artículo NR",
+        "artículo nr": "Artículo NR",
+        "codigo interno do concorrente": "Artículo NR",
+        "cod interno do concorrente": "Artículo NR",
+        "codigo interno": "Artículo NR",
+        "cod interno": "Artículo NR",
+
+        "articulo descripcion": "Artículo DESCRIPCION",
+        "artículo descripcion": "Artículo DESCRIPCION",
+        "descripcion": "Artículo DESCRIPCION",
+        "descripción": "Artículo DESCRIPCION",
+        "articulo": "Artículo DESCRIPCION",
+
+        "ean": "EAN",
+        "codigo de barras": "EAN",
+        "cod barras": "EAN",
+        "barcode": "EAN",
+
+        "area": "AREA",
+        "área": "AREA",
+
+        "main group": "MAIN GROUP",
+        "grupo principal": "MAIN GROUP",
+
+        "grupo": "GRUPO",
+    }
+
+    REQUIRED_SEARCH_COLUMNS = {"Artículo DESCRIPCION", "EAN"}
+
+    def __init__(self, input_file=None, store_id="200", sheet_name=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.input_file = input_file or "input.csv"
+        self.store_id = str(store_id)
+        self.sheet_name = sheet_name
+        self.api_key = "key_r6xzz4IAoTWcipni"
+        self.rows = []
 
-        if not ean and not arquivo_entrada and not termo:
-            raise ValueError(
-                "Passe ean, termo ou arquivo_entrada.\n"
-                "Ex.: -a ean=190679000019 | -a termo=cerveza | "
-                "-a arquivo_entrada='produtos.xlsx'"
-            )
+    # =========================
+    # INÍCIO DO FLUXO SCRAPY
+    # =========================
 
-        self.ean = ean
-        self.termo = termo
-        self.arquivo_entrada = arquivo_entrada
-        self.modo = (modo or "ambos").strip().lower()
+    def start_requests(self):
+        self.rows = self.load_input_rows(self.input_file, self.sheet_name)
+        self.logger.info(f"[START] Linhas carregadas: {len(self.rows)} | arquivo={self.input_file}")
 
-        if self.modo not in {"browser", "api", "ambos"}:
-            raise ValueError("modo deve ser: browser, api ou ambos")
+        if self.rows:
+            self.logger.info(f"[DEBUG] Primeira linha normalizada: {self.rows[0]}")
 
-    # -----------------------------
-    # resolução de caminho / leitura
-    # -----------------------------
-    def _resolver_caminho_arquivo(self, caminho_str: str) -> Path:
-        caminho = Path(caminho_str).expanduser()
-
-        if caminho.is_absolute():
-            return caminho
-
-        candidatos = [
-            Path.cwd() / caminho,
-            Path.cwd() / caminho.name,
-        ]
-
-        for cand in candidatos:
-            if cand.exists():
-                return cand
-
-        return candidatos[0]
-
-    def _normalizar_coluna(self, texto):
-        if texto is None:
-            return ""
-        texto = str(texto).strip().lower()
-        texto = unicodedata.normalize("NFKD", texto)
-        texto = "".join(ch for ch in texto if not unicodedata.combining(ch))
-        texto = re.sub(r"[^a-z0-9]+", " ", texto)
-        return " ".join(texto.split())
-
-    def _valor_limpo(self, valor):
-        if valor is None:
-            return ""
-        return str(valor).strip()
-
-    def _mapear_colunas(self, fieldnames):
-        nomes = {self._normalizar_coluna(c): c for c in fieldnames if c}
-
-        def pick(*aliases):
-            for alias in aliases:
-                chave = self._normalizar_coluna(alias)
-                if chave in nomes:
-                    return nomes[chave]
-            return None
-
-        return {
-            "ean": pick(
-                "ean",
-                "codigo ean",
-                "código ean",
-                "codigo_ean",
-                "codigoean",
-                "ean 13",
-                "cod ean",
-                "cod_ean",
+        headers = {
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/137.0.0.0 Safari/537.36"
             ),
-            "nome": pick(
-                "nome",
-                "producto",
-                "produto",
-                "descripcion",
-                "descrição",
-                "descricao",
-                "articulo",
-            ),
-            "marca": pick("marca", "brand"),
+            "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
+            "Referer": "https://www.cotodigital.com.ar/",
+            "Origin": "https://www.cotodigital.com.ar",
         }
 
-    def _montar_produto_de_row(self, row, colunas):
-        ean = (
-            self._valor_limpo(row.get(colunas["ean"]))
-            if colunas.get("ean")
-            else ""
-        )
-        if not ean:
-            return None
-
-        produto = {
-            "ean": ean,
-            "nome": self._valor_limpo(row.get(colunas["nome"]))
-            if colunas.get("nome")
-            else "",
-            "marca": self._valor_limpo(row.get(colunas["marca"]))
-            if colunas.get("marca")
-            else "",
-        }
-        return produto
-
-    def _ler_produtos_csv(self, caminho: Path):
-        produtos = []
-        with caminho.open("r", encoding="utf-8-sig", newline="") as f:
-            reader = csv.DictReader(f)
-            if not reader.fieldnames:
-                raise ValueError("CSV sem cabeçalho.")
-
-            colunas = self._mapear_colunas(reader.fieldnames)
-
-            if not colunas["ean"]:
-                raise ValueError(
-                    f"Não encontrei coluna de EAN no CSV. Cabeçalho: {reader.fieldnames}"
-                )
-
-            for row in reader:
-                produto = self._montar_produto_de_row(row, colunas)
-                if produto:
-                    produtos.append(produto)
-
-        vistos = set()
-        unicos = []
-        for p in produtos:
-            chave = (p["ean"], self._normalizar(p.get("nome")))
-            if chave not in vistos:
-                vistos.add(chave)
-                unicos.append(p)
-        return unicos
-
-    def _ler_produtos_xlsx(self, caminho: Path):
-        if openpyxl is None:
-            raise RuntimeError(
-                "openpyxl não está instalado. Rode: pip install openpyxl"
-            )
-
-        wb = openpyxl.load_workbook(
-            str(caminho), read_only=True, data_only=True
-        )
-        ws = wb[wb.sheetnames[0]]
-        rows = list(ws.iter_rows(values_only=True))
-        wb.close()
-
-        if not rows:
-            raise ValueError("Planilha vazia.")
-
-        header_row_idx = None
-        header = None
-
-        for idx, row in enumerate(rows[:40]):
-            nomes_linha = [
-                self._normalizar_coluna(h) if h is not None else ""
-                for h in row
-            ]
-            if any(
-                n
-                in {
-                    "ean",
-                    "codigo ean",
-                    "ean 13",
-                    "cod ean",
-                    "codigoean",
-                }
-                for n in nomes_linha
-            ):
-                header_row_idx = idx
-                header = [
-                    str(h).strip() if h is not None else "" for h in row
-                ]
-                break
-
-        if header_row_idx is None or header is None:
-            raise ValueError(
-                "Não encontrei linha de cabeçalho com coluna de EAN no XLSX."
-            )
-
-        colunas_map = self._mapear_colunas(header)
-        if not colunas_map["ean"]:
-            raise ValueError(
-                f"Não encontrei coluna de EAN no XLSX. Cabeçalho: {header}"
-            )
-
-        idx_por_nome = {nome: i for i, nome in enumerate(header)}
-
-        produtos = []
-        for row in rows[header_row_idx + 1 :]:
-            if not row:
-                continue
-
-            row_dict = {}
-            for nome_col, idx in idx_por_nome.items():
-                row_dict[nome_col] = row[idx] if idx < len(row) else None
-
-            produto = self._montar_produto_de_row(row_dict, colunas_map)
-            if produto:
-                produtos.append(produto)
-
-        vistos = set()
-        unicos = []
-        for p in produtos:
-            chave = (p["ean"], self._normalizar(p.get("nome")))
-            if chave not in vistos:
-                vistos.add(chave)
-                unicos.append(p)
-        return unicos
-
-    def _ler_produtos_arquivo(self, caminho_str: str):
-        caminho = self._resolver_caminho_arquivo(caminho_str)
-
-        if not caminho.exists():
-            raise FileNotFoundError(f"Arquivo não encontrado: {caminho}")
-
-        if caminho.suffix.lower() == ".csv":
-            return self._ler_produtos_csv(caminho)
-        elif caminho.suffix.lower() == ".xlsx":
-            return self._ler_produtos_xlsx(caminho)
-
-        raise ValueError("Arquivo de entrada deve ser .csv ou .xlsx")
-
-    # -----------------------------
-    # urls
-    # -----------------------------
-    def montar_url_busca_browser(self, termo: str) -> str:
-        termo = quote(str(termo).strip())
-        return (
-            "https://www.cotodigital.com.ar/sitios/cdigi/nuevositio?Ntt="
-            f"{termo}"
-        )
-
-    def montar_urls_api(self, termo: str):
-        termo = quote(str(termo).strip())
-        return {
-            (
-                "https://www.cotodigital.com.ar/"
-                "sitios/cdigi/categoria?_dyncharset=utf-8&Dy=1&Ntt="
-                f"{termo}"
-            ),
-            (
-                "https://www.cotodigital.com.ar/"
-                "sitios/cdigi/browse/_/N-1z141we?Ntt="
-                f"{termo}"
-            ),
-        }
-
-    def _get_selector(self, response):
-        raw = getattr(response, "raw_api_response", None) or {}
-        browser_html = raw.get("browserHtml")
-        if browser_html:
-            return Selector(text=browser_html)
-        return response
-
-    # -----------------------------
-    # util texto / matching
-    # -----------------------------
-    def limpar_texto(self, texto):
-        if not texto:
-            return None
-        return " ".join(str(texto).split()).strip()
-
-    def _strip_accents(self, txt: str):
-        if not txt:
-            return ""
-        txt = unicodedata.normalize("NFKD", str(txt))
-        return "".join(ch for ch in txt if not unicodedata.combining(ch))
-
-    def _normalizar(self, txt: str):
-        if not txt:
-            return ""
-        txt = self._strip_accents(str(txt)).lower()
-        txt = re.sub(r"[^a-z0-9]+", " ", txt)
-        return " ".join(txt.split())
-
-    def _tokenizar(self, txt: str):
-        txt = self._normalizar(txt)
-        if not txt:
-            return []
-        return [t for t in txt.split() if t]
-
-    def _palavras_relevantes(self, txt: str, limite=6):
-        tokens = self._tokenizar(txt)
-        stop = {
-            "fid",
-            "pq",
-            "pqx",
-            "x500g",
-            "x1k",
-            "x1kg",
-            "de",
-            "del",
-            "la",
-            "el",
-            "con",
-            "sin",
-            "fort",
-            "v",
-            "zinc",
-            "for",
-            "n",
-            "no",
-        }
-        saida = []
-        for t in tokens:
-            if t in stop:
-                continue
-            if re.fullmatch(r"\d+", t):
-                continue
-            saida.append(t)
-        return saida[:limite]
-
-    def _gerar_consultas_produto(self, produto: dict):
-        """
-        Ordem simples de prioridade para reduzir volume:
-        1) EAN
-        2) nome completo normalizado
-        3) marca + palavras relevantes do nome
-        """
-        consultas = []
-
-        ean = self._valor_limpo(produto.get("ean"))
-        nome = self._valor_limpo(produto.get("nome"))
-        marca = self._valor_limpo(produto.get("marca"))
-
-        nome_norm = self._normalizar(nome)
-        marca_norm = self._normalizar(marca)
-        palavras_nome = self._palavras_relevantes(nome, limite=5)
-
-        def add(tipo, valor, prioridade):
-            valor = self.limpar_texto(valor)
-            if valor:
-                consultas.append((tipo, valor, prioridade))
-
-        if ean:
-            add("ean", ean, 1)
-
-        if nome_norm:
-            add("nome_completo", nome_norm, 2)
-
-        if marca_norm and palavras_nome:
-            add("marca_palavras", f"{marca_norm} {' '.join(palavras_nome)}", 3)
-
-        vistos = set()
-        saida = []
-        for tipo, valor, prioridade in consultas:
-            chave = self._normalizar(f"{tipo}|{valor}")
-            if chave not in vistos:
-                vistos.add(chave)
-                saida.append((tipo, valor, prioridade))
-        return saida
-
-    # -----------------------------
-    # preço / marca / sem resultado
-    # -----------------------------
-    def extrair_preco(self, texto: str):
-        if not texto:
-            return None
-
-        texto = " ".join(texto.split())
-        padroes = [
-            r"\$\s*\d{1,3}(?:\.\d{3})*(?:,\d{2})?",
-            r"\d{1,3}(?:\.\d{3})*,\d{2}",
-        ]
-
-        for padrao in padroes:
-            m = re.search(padrao, texto, flags=re.IGNORECASE)
-            if m:
-                valor = m.group(0)
-                if not valor.startswith("$"):
-                    valor = f"$ {valor}"
-                return valor
-
-        return None
-
-    def extrair_marca(self, nome):
-        if not nome:
-            return None
-        partes = self.limpar_texto(nome).split()
-        return partes[0] if partes else None
-
-    def detectar_sem_resultado(self, texto):
-        if not texto:
-            return False
-        t = texto.lower()
-        sinais = [
-            "no se encontraron resultados",
-            "no encontramos productos",
-            "sin resultados",
-            "ningún resultado",
-            "ningun resultado",
-        ]
-        return any(s in t for s in sinais)
-
-    # -----------------------------
-    # score de match (simples)
-    # -----------------------------
-    def _pontuar_match(
-        self, produto_origem, nome_encontrado, busca_valor, tipo_busca
-    ):
-        score = 0
-        if not produto_origem:
-            return score
-
-        nome_encontrado_norm = self._normalizar(nome_encontrado)
-        nome_origem = self._normalizar(produto_origem.get("nome"))
-        marca_origem = self._normalizar(produto_origem.get("marca"))
-        ean_origem = self._valor_limpo(produto_origem.get("ean"))
-
-        if tipo_busca == "ean" and busca_valor == ean_origem:
-            score += 100
-
-        if nome_origem and nome_origem in nome_encontrado_norm:
-            score += 40
-
-        tokens_nome = set(self._palavras_relevantes(nome_origem, limite=8))
-        tokens_achado = set(self._tokenizar(nome_encontrado_norm))
-        inter = tokens_nome & tokens_achado
-        score += len(inter) * 8
-
-        if marca_origem and marca_origem in nome_encontrado_norm:
-            score += 15
-
-        return score
-
-    # -----------------------------
-    # HTML → produto
-    # -----------------------------
-    def extrair_produto_html(self, sel: Selector):
-        candidatos = []
-
-        blocos = sel.css(
-            "div.product, li.product, .product-item, .producto, "
-            ".product-card, .search-results-item, .prod_details, "
-            ".product_info_wrapper"
-        )
-
-        for bloco in blocos[:80]:
-            nome = self.limpar_texto(
-                bloco.css(
-                    "h1::text, h2::text, h3::text, "
-                    ".product-name::text, .productName::text, "
-                    ".nombre-producto::text, .descrip_full::text, "
-                    "a::attr(title), a::text"
-                ).get()
-            )
-            textos = [
-                self.limpar_texto(t)
-                for t in bloco.css("::text").getall()
-                if self.limpar_texto(t)
-            ]
-            bloco_texto = " ".join(textos)
-            preco = self.extrair_preco(bloco_texto)
-
-            link = bloco.css("a::attr(href)").get()
-            if link:
-                link = urljoin(
-                    self.settings.get(
-                        "START_URL", "https://www.cotodigital.com.ar"
-                    ),
-                    link,
-                )
-
-            if nome or preco:
-                candidatos.append(
-                    {
-                        "nome": nome,
-                        "preco": preco,
-                        "link": link,
-                        "texto": bloco_texto,
-                    }
-                )
-
-        if candidatos:
-            escolhido = max(
-                candidatos,
-                key=lambda x: (
-                    1 if x.get("preco") else 0,
-                    len(x.get("nome") or ""),
-                ),
-            )
-            return {
-                "nome": escolhido.get("nome"),
-                "preco": escolhido.get("preco"),
-                "link": escolhido.get("link"),
-            }
-
-        # Se não achei bloco de produto, não inventar usando <title>
-        return None
-
-    # -----------------------------
-    # JSON → produto (fallback genérico)
-    # -----------------------------
-    def extrair_produto_json(self, data):
-        if isinstance(data, dict):
-            nome_keys = [
-                "name",
-                "displayName",
-                "productDisplayName",
-                "description",
-            ]
-            preco_keys = ["price", "listPrice", "salePrice", "precio"]
-            link_keys = ["url", "link", "productUrl"]
-
-            nome = None
-            preco = None
-            link = None
-
-            for k in nome_keys:
-                if data.get(k):
-                    nome = self.limpar_texto(data.get(k))
-                    break
-
-            for k in preco_keys:
-                v = data.get(k)
-                if v is None:
-                    continue
-                if isinstance(v, (int, float)):
-                    preco = (
-                        f"$ {v:,.2f}"
-                        .replace(",", "X")
-                        .replace(".", ",")
-                        .replace("X", ".")
-                    )
-                else:
-                    preco = self.extrair_preco(str(v)) or self.limpar_texto(v)
-                if preco:
-                    break
-
-            for k in link_keys:
-                if data.get(k):
-                    link = self.limpar_texto(data.get(k))
-                    break
-
-            if nome or preco:
-                return {"nome": nome, "preco": preco, "link": link}
-
-            for v in data.values():
-                achou = self.extrair_produto_json(v)
-                if achou:
-                    return achou
-
-        elif isinstance(data, list):
-            for item in data:
-                achou = self.extrair_produto_json(item)
-                if achou:
-                    return achou
-
-        return None
-
-    # -----------------------------
-    # montar item
-    # -----------------------------
-    def montar_item(
-        self,
-        response,
-        tipo_busca,
-        busca_valor,
-        prioridade_busca=None,
-        nome=None,
-        preco=None,
-        link=None,
-        origem="browser",
-        produto_origem=None,
-    ):
-        nome = self.limpar_texto(nome)
-        preco = self.limpar_texto(preco)
-
-        status = (
-            "resultado_busca" if (nome or preco) else "nao_indexado_na_busca"
-        )
-
-        ean_entrada = None
-        nome_entrada = None
-        marca_entrada = None
-        score_match = 0
-
-        if produto_origem:
-            ean_entrada = produto_origem.get("ean")
-            nome_entrada = produto_origem.get("nome")
-            marca_entrada = produto_origem.get("marca")
-            score_match = self._pontuar_match(
-                produto_origem, nome, busca_valor, tipo_busca
-            )
-
-        return {
-            "loja": "cotodigital_ar",
-            "origem_extracao": origem,
-            "tipo_busca": tipo_busca,
-            "prioridade_busca": prioridade_busca,
-            "busca_valor": busca_valor,
-            "ean": ean_entrada
-            if ean_entrada
-            else (busca_valor if tipo_busca == "ean" else None),
-            "nome": nome,
-            "marca": self.extrair_marca(nome) or marca_entrada,
-            "preco": preco,
-            "link": link or response.url,
-            "status_busca": status,
-            "score_match": score_match,
-            "ean_entrada": ean_entrada,
-            "nome_entrada": nome_entrada,
-            "marca_entrada": marca_entrada,
-        }
-
-    # -----------------------------
-    # start
-    # -----------------------------
-    async def start(self):
-        if self.arquivo_entrada:
-            caminho_resolvido = self._resolver_caminho_arquivo(
-                self.arquivo_entrada
-            )
-            self.logger.info(
-                "Lendo arquivo de entrada: %s", caminho_resolvido
-            )
-
-            produtos = self._ler_produtos_arquivo(self.arquivo_entrada)
-            self.logger.info(
-                "Processando %d produtos do arquivo", len(produtos)
-            )
-
-            for produto in produtos:
-                consultas = self._gerar_consultas_produto(produto)
+        for idx, row in enumerate(self.rows, start=1):
+            articulo_nr = self.clean_text(row.get("Artículo NR", ""))
+            descripcion = self.clean_text(row.get("Artículo DESCRIPCION", ""))
+            ean = self.clean_ean(row.get("EAN", ""))
+
+            if idx <= 5:
                 self.logger.info(
-                    "Produto EAN=%s | nome=%s | consultas=%s",
-                    produto.get("ean"),
-                    produto.get("nome"),
-                    [f"{tipo}:{valor}" for tipo, valor, _ in consultas],
+                    f"[ROW {idx}] articulo_nr={articulo_nr} | descricao={descripcion[:80]} | ean={ean}"
                 )
 
-                for tipo_busca, valor_busca, prioridade in consultas:
-                    for req in self._gerar_requests_busca(
-                        valor_busca, tipo_busca, prioridade
-                    ):
-                        req.meta.setdefault("produto_origem", produto)
-                        yield req
-            return
+            termos = []
+            if ean:
+                termos.append(("ean", ean))
+            if descripcion:
+                termos.append(("descripcion", descripcion))
 
-        valor_busca = self.termo or self.ean
-        tipo_busca = "termo" if self.termo else "ean"
-        prioridade = 1
+            if not termos:
+                yield self.build_empty_item(
+                    row=row,
+                    erro="Linha sem EAN e sem descrição para busca."
+                )
+                continue
 
-        for req in self._gerar_requests_busca(
-            str(valor_busca), tipo_busca, prioridade
-        ):
-            yield req
+            busca_tipo, termo = termos[0]
+            url = self.build_search_url(termo)
 
-    def _gerar_requests_busca(
-        self, valor_busca, tipo_busca, prioridade_busca=1
-    ):
-        if self.modo in {"browser", "ambos"}:
-            yield Request(
-                url=self.montar_url_busca_browser(valor_busca),
-                callback=self.parse_search_browser,
+            self.logger.info(
+                f"[SEARCH] tipo={busca_tipo} | termo={termo} | artigo_nr={articulo_nr}"
+            )
+
+            yield scrapy.Request(
+                url=url,
+                callback=self.parse_search,
+                errback=self.errback_search,
                 dont_filter=True,
+                headers=headers,
                 meta={
-                    "busca_valor": valor_busca,
-                    "tipo_busca": tipo_busca,
-                    "prioridade_busca": prioridade_busca,
-                    "tentativa_origem": "browser",
-                    "zyte_api_automap": {
-                        "browserHtml": True,
-                        "actions": [
-                            {"action": "waitForTimeout", "timeout": 2},
-                            {"action": "scrollBottom"},
-                            {"action": "waitForTimeout", "timeout": 2},
-                            {"action": "scrollBottom"},
-                            {"action": "waitForTimeout", "timeout": 1},
-                        ],
-                    },
+                    "row": row,
+                    "headers_used": headers,
+                    "search_attempt_index": 0,
+                    "search_terms": termos,
+                    "search_tipo": busca_tipo,
+                    "search_termo": termo,
                 },
             )
 
-        if self.modo in {"api", "ambos"}:
-            for url in self.montar_urls_api(valor_busca):
-                yield Request(
-                    url=url,
-                    callback=self.parse_search_api,
-                    dont_filter=True,
-                    meta={
-                        "busca_valor": valor_busca,
-                        "tipo_busca": tipo_busca,
-                        "prioridade_busca": prioridade_busca,
-                        "tentativa_origem": "api",
-                    },
-                    headers={
-                        "Accept": (
-                            "text/html,application/json,application/"
-                            "xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-                        ),
-                        "User-Agent": "Mozilla/5.0",
-                    },
-                )
-
-    # -----------------------------
-    # parse modo browser
-    # -----------------------------
-    def parse_search_browser(self, response):
-        busca_valor = response.meta.get("busca_valor")
-        tipo_busca = response.meta.get("tipo_busca")
-        prioridade_busca = response.meta.get("prioridade_busca")
-        produto_origem = response.meta.get("produto_origem")
-        sel = self._get_selector(response)
+    def parse_search(self, response):
+        row = response.meta["row"]
+        headers = response.meta["headers_used"]
+        search_attempt_index = response.meta["search_attempt_index"]
+        search_terms = response.meta["search_terms"]
+        search_tipo = response.meta["search_tipo"]
+        search_termo = response.meta["search_termo"]
 
         self.logger.info(
-            "[BROWSER] Busca %s | prioridade=%s | valor=%s | URL=%s",
-            tipo_busca,
-            prioridade_busca,
-            busca_valor,
-            response.url,
+            f"[SEARCH_RESPONSE] status={response.status} | tipo={search_tipo} | termo={search_termo}"
         )
 
-        textos = [
-            self.limpar_texto(t)
-            for t in sel.css("body ::text").getall()
-            if self.limpar_texto(t)
-        ]
-        corpo = " ".join(textos)
+        data = response.json()
+        response_data = data.get("response", {})
+        results = response_data.get("results", []) or []
 
-        if self.detectar_sem_resultado(corpo):
-            yield self.montar_item(
-                response=response,
-                tipo_busca=tipo_busca,
-                busca_valor=busca_valor,
-                prioridade_busca=prioridade_busca,
-                nome=None,
-                preco=None,
-                origem="browser",
-                produto_origem=produto_origem,
+        results = results[:10]
+
+        best = self.choose_best_result(row, results)
+
+        if best:
+            data_map = self.extract_result_fields(best)
+
+            yield {
+                "articulo_nr": row.get("Artículo NR", ""),
+                "articulo_descripcion": row.get("Artículo DESCRIPCION", ""),
+                "ean_entrada": row.get("EAN", ""),
+                "area": row.get("AREA", ""),
+                "main_group": row.get("MAIN GROUP", ""),
+                "grupo": row.get("GRUPO", ""),
+
+                "busca_tipo": search_tipo,
+                "busca_termo": search_termo,
+                "produto_encontrado": True,
+                "score_match": best.get("_score_match", ""),
+
+                "nome_coto": data_map.get("nome", ""),
+                "marca_coto": data_map.get("marca", ""),
+                "preco_coto": data_map.get("preco", ""),
+                "preco_referencia_coto": data_map.get("preco_referencia", ""),
+                "ean_coto": data_map.get("ean", ""),
+                "sku_coto": data_map.get("sku", ""),
+                "url_produto": data_map.get("url", ""),
+                "imagem": data_map.get("imagem", ""),
+
+                "search_url": response.url,
+                "total_resultados": response_data.get("total_num_results", 0),
+                "erro": "",
+            }
+            return
+
+        next_attempt = search_attempt_index + 1
+        if next_attempt < len(search_terms):
+            novo_tipo, novo_termo = search_terms[next_attempt]
+            nova_url = self.build_search_url(novo_termo)
+
+            self.logger.info(
+                f"[RETRY_SEARCH] tipo={novo_tipo} | termo={novo_termo} | artigo_nr={row.get('Artículo NR', '')}"
+            )
+
+            yield scrapy.Request(
+                url=nova_url,
+                callback=self.parse_search,
+                errback=self.errback_search,
+                dont_filter=True,
+                headers=headers,
+                meta={
+                    "row": row,
+                    "headers_used": headers,
+                    "search_attempt_index": next_attempt,
+                    "search_terms": search_terms,
+                    "search_tipo": novo_tipo,
+                    "search_termo": novo_termo,
+                },
             )
             return
 
-        produto = self.extrair_produto_html(sel) or {}
-
-        link = produto.get("link")
-        if link and link.startswith("/"):
-            link = response.urljoin(link)
-
-        yield self.montar_item(
-            response=response,
-            tipo_busca=tipo_busca,
-            busca_valor=busca_valor,
-            prioridade_busca=prioridade_busca,
-            nome=produto.get("nome"),
-            preco=produto.get("preco"),
-            link=link,
-            origem="browser",
-            produto_origem=produto_origem,
+        yield self.build_empty_item(
+            row=row,
+            busca_tipo=search_tipo,
+            busca_termo=search_termo,
+            search_url=response.url,
+            total_resultados=response_data.get("total_num_results", 0),
+            erro="Nenhum resultado compatível encontrado."
         )
 
-    # -----------------------------
-    # parse modo api
-    # -----------------------------
-    def parse_search_api(self, response):
-        busca_valor = response.meta.get("busca_valor")
-        tipo_busca = response.meta.get("tipo_busca")
-        prioridade_busca = response.meta.get("prioridade_busca")
-        produto_origem = response.meta.get("produto_origem")
+    def errback_search(self, failure):
+        request = getattr(failure, "request", None)
+        row = request.meta.get("row", {}) if request else {}
+        search_tipo = request.meta.get("search_tipo", "") if request else ""
+        search_termo = request.meta.get("search_termo", "") if request else ""
 
-        self.logger.info(
-            "[API] Busca %s | prioridade=%s | valor=%s | status=%s | URL=%s | content-type=%s",
-            tipo_busca,
-            prioridade_busca,
-            busca_valor,
-            response.status,
-            response.url,
-            response.headers.get("Content-Type", b"").decode(
-                "utf-8", "ignore"
-            ),
+        yield self.build_empty_item(
+            row=row,
+            busca_tipo=search_tipo,
+            busca_termo=search_termo,
+            search_url=request.url if request else "",
+            total_resultados="",
+            erro=repr(failure.value),
         )
 
-        content_type = response.headers.get("Content-Type", b"").decode(
-            "utf-8", "ignore"
-        ).lower()
+    def build_search_url(self, termo):
+        termo = self.clean_text(termo)
+        termo_enc = quote(termo, safe="")
+        pre_filter = quote(
+            json.dumps({"name": "store_availability", "value": self.store_id}, separators=(",", ":")),
+            safe=""
+        )
+        return (
+            "https://api.coto.com.ar/api/v1/ms-digital-sitio-bff-web/api/v1/products/search/"
+            f"{termo_enc}?key={self.api_key}&num_results_per_page=24&pre_filter_expression={pre_filter}"
+        )
 
-        nome = None
-        preco = None
-        link = None
+    # =========================
+    # ESCOLHA DO MELHOR RESULT
+    # =========================
 
-        # 1) JSON
-        if "json" in content_type:
+    def choose_best_result(self, row, results):
+        ean_entrada = self.clean_ean(row.get("EAN", ""))
+        desc_entrada = self.normalize_text(row.get("Artículo DESCRIPCION", ""))
+        area_entrada = self.normalize_text(row.get("AREA", ""))
+        main_group_entrada = self.normalize_text(row.get("MAIN GROUP", ""))
+        grupo_entrada = self.normalize_text(row.get("GRUPO", ""))
+
+        best = None
+        best_score = -1
+
+        for result in results:
+            data_map = self.extract_result_fields(result)
+
+            nome = self.normalize_text(data_map.get("nome", ""))
+            marca = self.normalize_text(data_map.get("marca", ""))
+            categoria_texto = " ".join(
+                x for x in [
+                    self.normalize_text(result.get("data", {}).get("AREA", "")),
+                    self.normalize_text(result.get("data", {}).get("MAIN GROUP", "")),
+                    self.normalize_text(result.get("data", {}).get("GRUPO", "")),
+                ] if x
+            )
+
+            ean_result = self.clean_ean(data_map.get("ean", ""))
+            sku_result = self.clean_text(data_map.get("sku", ""))
+
+            score = 0
+
+            if ean_entrada and ean_result and ean_entrada == ean_result:
+                score += 100
+
+            if ean_entrada and sku_result and ean_entrada in sku_result:
+                score += 20
+
+            if desc_entrada and nome:
+                score += int(100 * SequenceMatcher(None, desc_entrada, nome).ratio())
+
+            if desc_entrada and marca and marca in desc_entrada:
+                score += 10
+
+            categorias_entrada = " ".join(x for x in [area_entrada, main_group_entrada, grupo_entrada] if x)
+            if categorias_entrada and categoria_texto:
+                score += int(30 * SequenceMatcher(None, categorias_entrada, categoria_texto).ratio())
+
+            result["_score_match"] = score
+
+            if score > best_score:
+                best_score = score
+                best = result
+
+        if best is not None:
+            best["_score_match"] = best_score
+
+        return best
+
+    # =========================
+    # FILTRO DE PREÇO (formatPrice)
+    # =========================
+
+    def _extrair_format_price_de_raw(self, raw_prices):
+        """
+        Filtra apenas o formatPrice/listPrice da loja self.store_id.
+        Garante retorno como strings simples (sem lista/dict).
+        """
+        if not raw_prices:
+            return "", ""
+
+        if isinstance(raw_prices, list):
+            preco_list = raw_prices
+        elif isinstance(raw_prices, str):
             try:
-                data = json.loads(response.text)
-                produto = self.extrair_produto_json(data)
-                if produto:
-                    nome = produto.get("nome")
-                    preco = produto.get("preco")
-                    link = produto.get("link")
-            except Exception as e:
-                self.logger.debug(
-                    "Falha ao interpretar JSON em %s: %s", response.url, e
-                )
+                preco_list = literal_eval(raw_prices)
+            except Exception:
+                preco_list = []
+        elif isinstance(raw_prices, dict):
+            preco_list = [raw_prices]
+        else:
+            try:
+                preco_list = list(raw_prices)
+            except Exception:
+                preco_list = []
 
-        # 2) HTML
-        if not nome and not preco:
-            sel = Selector(text=response.text)
-            textos = [
-                self.limpar_texto(t)
-                for t in sel.css("body ::text").getall()
-                if self.limpar_texto(t)
-            ]
-            corpo = " ".join(textos)
+        if not preco_list:
+            return "", ""
 
-            if self.detectar_sem_resultado(corpo):
-                yield self.montar_item(
-                    response=response,
-                    tipo_busca=tipo_busca,
-                    busca_valor=busca_valor,
-                    prioridade_busca=prioridade_busca,
-                    nome=None,
-                    preco=None,
-                    origem="api",
-                    produto_origem=produto_origem,
-                )
-                return
+        store_target = self.store_id.zfill(3)
+        chosen = None
 
-            produto = self.extrair_produto_html(sel)
-            if produto:
-                nome = produto.get("nome")
-                preco = produto.get("preco")
-                link = produto.get("link")
+        for p in preco_list:
+            if not isinstance(p, dict):
+                continue
+            store = str(p.get("store", "")).zfill(3)
+            if store == store_target:
+                chosen = p
+                break
 
-        if link and link.startswith("/"):
-            link = response.urljoin(link)
+        if chosen is None:
+            for p in preco_list:
+                if isinstance(p, dict) and (
+                    p.get("formatPrice") is not None or p.get("listPrice") is not None
+                ):
+                    chosen = p
+                    break
 
-        yield self.montar_item(
-            response=response,
-            tipo_busca=tipo_busca,
-            busca_valor=busca_valor,
-            prioridade_busca=prioridade_busca,
-            nome=nome,
-            preco=preco,
-            link=link,
-            origem="api",
-            produto_origem=produto_origem,
+        if chosen is None or not isinstance(chosen, dict):
+            return "", ""
+
+        format_price = chosen.get("formatPrice")
+        list_price = chosen.get("listPrice")
+
+        preco = ""
+        preco_referencia = ""
+
+        if format_price not in (None, ""):
+            preco = str(format_price)
+
+        if list_price not in (None, ""):
+            preco_referencia = str(list_price)
+
+        return preco, preco_referencia
+
+    def extract_result_fields(self, result):
+        data = result.get("data", {}) or {}
+
+        imagem = ""
+        image_url = data.get("image_url")
+        image_urls = data.get("image_urls")
+        if image_url:
+            imagem = image_url
+        elif isinstance(image_urls, list) and image_urls:
+            imagem = image_urls[0]
+
+        raw_prices = (
+            data.get("prices")
+            or data.get("price_list")
+            or data.get("priceList")
+            or data.get("storePrices")
         )
+
+        preco, preco_referencia = self._extrair_format_price_de_raw(raw_prices)
+
+        if not preco:
+            raw_p = data.get("price") or data.get("current_price") or ""
+            if raw_p not in (None, ""):
+                preco = str(raw_p)
+
+        if not preco_referencia:
+            raw_pr = (
+                data.get("list_price")
+                or data.get("original_price")
+                or data.get("reference_price")
+                or ""
+            )
+            if raw_pr not in (None, ""):
+                preco_referencia = str(raw_pr)
+
+        return {
+            "nome": data.get("product_name") or data.get("name") or result.get("value", "") or "",
+            "marca": data.get("brand") or data.get("product_brand") or "",
+            "preco": preco,
+            "preco_referencia": preco_referencia,
+            "ean": data.get("ean") or data.get("gtin") or data.get("barcode") or "",
+            "sku": data.get("sku") or data.get("id") or result.get("id", "") or "",
+            "url": data.get("url") or data.get("product_url") or "",
+            "imagem": imagem,
+        }
+
+    # =========================
+    # LEITURA DE INPUT (CSV/XLSX)
+    # =========================
+
+    def load_input_rows(self, file_path, sheet_name=None):
+        path = Path(file_path)
+
+        if not path.exists():
+            raise FileNotFoundError(f"Arquivo não encontrado: {path}")
+
+        suffix = path.suffix.lower()
+
+        if suffix == ".csv":
+            return self.load_csv_rows(path)
+
+        if suffix in [".xlsx", ".xlsm"]:
+            return self.load_xlsx_rows(path, sheet_name)
+
+        raise ValueError(f"Extensão não suportada: {suffix}")
+
+    def load_csv_rows(self, path):
+        with open(path, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.reader(f)
+            all_rows = list(reader)
+
+        if not all_rows:
+            return []
+
+        header_idx = self.find_header_row_index(all_rows)
+        headers = [self.map_header_name(h) for h in all_rows[header_idx]]
+        self.logger.info(f"[CSV] Header row index: {header_idx}")
+        self.logger.info(f"[CSV] Headers mapeados: {headers}")
+
+        output = []
+        for raw_values in all_rows[header_idx + 1:]:
+            if not raw_values or all(not self.clean_text(v) for v in raw_values):
+                continue
+
+            row = {}
+            for idx, header in enumerate(headers):
+                if not header:
+                    continue
+                value = raw_values[idx] if idx < len(raw_values) else ""
+                row[header] = self.clean_cell_value(value)
+
+            output.append(row)
+
+        return output
+
+    def load_xlsx_rows(self, path, sheet_name=None):
+        wb = load_workbook(filename=path, read_only=True, data_only=True)
+
+        if sheet_name and sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+        else:
+            ws = self.choose_best_sheet(wb)
+
+        self.logger.info(f"[XLSX] Aba usada: {ws.title}")
+
+        all_rows = []
+        for row in ws.iter_rows(values_only=True):
+            all_rows.append([self.clean_cell_value(cell) for cell in row])
+
+        if not all_rows:
+            return []
+
+        header_idx = self.find_header_row_index(all_rows)
+        raw_headers = all_rows[header_idx]
+        mapped_headers = [self.map_header_name(h) for h in raw_headers]
+
+        self.logger.info(f"[XLSX] Header row index: {header_idx}")
+        self.logger.info(f"[XLSX] Headers brutos: {raw_headers}")
+        self.logger.info(f"[XLSX] Headers mapeados: {mapped_headers}")
+
+        output = []
+        for raw_values in all_rows[header_idx + 1:]:
+            if not raw_values or all(not self.clean_text(v) for v in raw_values):
+                continue
+
+            row = {}
+            for idx, header in enumerate(mapped_headers):
+                if not header:
+                    continue
+                value = raw_values[idx] if idx < len(raw_values) else ""
+                row[header] = self.clean_cell_value(value)
+
+            if any(self.clean_text(v) for v in row.values()):
+                output.append(row)
+
+        return output
+
+    def choose_best_sheet(self, workbook):
+        best_ws = workbook[workbook.sheetnames[0]]
+        best_score = -1
+
+        for sheet_name in workbook.sheetnames:
+            ws = workbook[sheet_name]
+
+            preview_rows = []
+            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                if i >= 15:
+                    break
+                preview_rows.append([self.clean_cell_value(cell) for cell in row])
+
+            score = self.score_sheet(preview_rows)
+            self.logger.info(f"[XLSX] Score aba '{ws.title}': {score}")
+
+            if score > best_score:
+                best_score = score
+                best_ws = ws
+
+        return best_ws
+
+    def score_sheet(self, rows):
+        best = 0
+        for row in rows[:15]:
+            normalized = [self.normalize_header(v) for v in row if self.clean_text(v)]
+            score = 0
+            for col in normalized:
+                if col in self.HEADER_ALIASES:
+                    score += 1
+            best = max(best, score)
+        return best
+
+    def find_header_row_index(self, rows):
+        best_index = 0
+        best_score = -1
+        max_rows = min(len(rows), 20)
+
+        for idx in range(max_rows):
+            row = rows[idx]
+            normalized = [self.normalize_header(v) for v in row if self.clean_text(v)]
+
+            score = 0
+            found_mapped = set()
+
+            for col in normalized:
+                mapped = self.HEADER_ALIASES.get(col)
+                if mapped:
+                    score += 1
+                    found_mapped.add(mapped)
+
+            if "EAN" in found_mapped:
+                score += 2
+            if "Artículo DESCRIPCION" in found_mapped:
+                score += 2
+
+            if score > best_score:
+                best_score = score
+                best_index = idx
+
+        self.logger.info(f"[HEADER] Linha escolhida como cabeçalho: {best_index} | score={best_score}")
+        return best_index
+
+    def map_header_name(self, header):
+        normalized = self.normalize_header(header)
+        return self.HEADER_ALIASES.get(normalized, self.clean_text(header))
+
+    def normalize_header(self, value):
+        value = self.clean_text(value)
+        value = value.replace("\n", " ").replace("\r", " ").replace("_", " ")
+        value = re.sub(r"\s+", " ", value).strip().lower()
+        value = unicodedata.normalize("NFKD", value)
+        value = "".join(ch for ch in value if not unicodedata.combining(ch))
+        return value
+
+    # =========================
+    # ITENS VAZIOS / LIMPEZA
+    # =========================
+
+    def build_empty_item(
+        self,
+        row,
+        busca_tipo="",
+        busca_termo="",
+        search_url="",
+        total_resultados="",
+        erro="",
+    ):
+        return {
+            "articulo_nr": row.get("Artículo NR", ""),
+            "articulo_descripcion": row.get("Artículo DESCRIPCION", ""),
+            "ean_entrada": row.get("EAN", ""),
+            "area": row.get("AREA", ""),
+            "main_group": row.get("MAIN GROUP", ""),
+            "grupo": row.get("GRUPO", ""),
+            "busca_tipo": busca_tipo,
+            "busca_termo": busca_termo,
+            "produto_encontrado": False,
+            "score_match": "",
+            "nome_coto": "",
+            "marca_coto": "",
+            "preco_coto": "",
+            "preco_referencia_coto": "",
+            "ean_coto": "",
+            "sku_coto": "",
+            "url_produto": "",
+            "imagem": "",
+            "search_url": search_url,
+            "total_resultados": total_resultados,
+            "erro": erro,
+        }
+
+    def clean_cell_value(self, value):
+        if value is None:
+            return ""
+        if isinstance(value, float):
+            if value.is_integer():
+                return str(int(value))
+            return str(value)
+        return str(value).strip()
+
+    def clean_text(self, value):
+        if value is None:
+            return ""
+        return str(value).strip()
+
+    def clean_ean(self, value):
+        if value is None:
+            return ""
+        value = str(value).strip()
+        digits = re.sub(r"\D+", "", value)
+        return digits
+
+    def normalize_text(self, value):
+        value = self.clean_text(value).lower()
+        value = unicodedata.normalize("NFKD", value)
+        value = "".join(ch for ch in value if not unicodedata.combining(ch))
+        value = re.sub(r"[^a-z0-9\s]", " ", value, flags=re.IGNORECASE)
+        value = re.sub(r"\s+", " ", value).strip()
+        return value
