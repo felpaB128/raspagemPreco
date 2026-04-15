@@ -155,6 +155,16 @@ class CotodigitalMkSpider(scrapy.Spider):
         if best:
             data_map = self.extract_result_fields(best)
 
+            raw_preco = data_map.get("preco", "")
+            raw_ref = data_map.get("preco_referencia", "")
+
+            preco_coto = self._simplificar_preco_saida(raw_preco, prefer="formatPrice")
+            preco_ref = self._simplificar_preco_saida(raw_ref, prefer="listPrice")
+
+            self.logger.info(
+                f"[DEBUG_PRECO_FINAL] store_id={self.store_id} | preco_coto={preco_coto} | preco_ref={preco_ref}"
+            )
+
             yield {
                 "articulo_nr": row.get("Artículo NR", ""),
                 "articulo_descripcion": row.get("Artículo DESCRIPCION", ""),
@@ -170,8 +180,8 @@ class CotodigitalMkSpider(scrapy.Spider):
 
                 "nome_coto": data_map.get("nome", ""),
                 "marca_coto": data_map.get("marca", ""),
-                "preco_coto": data_map.get("preco", ""),
-                "preco_referencia_coto": data_map.get("preco_referencia", ""),
+                "preco_coto": preco_coto,
+                "preco_referencia_coto": preco_ref,
                 "ean_coto": data_map.get("ean", ""),
                 "sku_coto": data_map.get("sku", ""),
                 "url_produto": data_map.get("url", ""),
@@ -305,13 +315,13 @@ class CotodigitalMkSpider(scrapy.Spider):
         return best
 
     # =========================
-    # FILTRO DE PREÇO (formatPrice)
+    # FILTRO DE PREÇO
     # =========================
 
     def _extrair_format_price_de_raw(self, raw_prices):
         """
         Filtra apenas o formatPrice/listPrice da loja self.store_id.
-        Garante retorno como strings simples (sem lista/dict).
+        Garante retorno como strings simples.
         """
         if not raw_prices:
             return "", ""
@@ -370,6 +380,61 @@ class CotodigitalMkSpider(scrapy.Spider):
 
         return preco, preco_referencia
 
+    def _simplificar_preco_saida(self, valor, prefer="formatPrice"):
+        """
+        Última camada de proteção:
+        se por algum motivo vier lista/dict/string de lista, transforma em valor simples.
+        """
+        if valor in (None, ""):
+            return ""
+
+        if isinstance(valor, (int, float)):
+            if isinstance(valor, float) and valor.is_integer():
+                return str(int(valor))
+            return str(valor)
+
+        if isinstance(valor, dict):
+            if prefer == "listPrice":
+                return str(valor.get("listPrice") or valor.get("formatPrice") or "")
+            return str(valor.get("formatPrice") or valor.get("listPrice") or "")
+
+        parsed = valor
+        if isinstance(valor, str):
+            texto = valor.strip()
+            try:
+                parsed = literal_eval(texto)
+            except Exception:
+                return texto
+
+        if isinstance(parsed, list) and parsed:
+            loja_alvo = str(self.store_id).zfill(3)
+            escolhido = None
+
+            for p in parsed:
+                if isinstance(p, dict) and str(p.get("store", "")).zfill(3) == loja_alvo:
+                    escolhido = p
+                    break
+
+            if escolhido is None:
+                for p in parsed:
+                    if isinstance(p, dict):
+                        escolhido = p
+                        break
+
+            if not isinstance(escolhido, dict):
+                return ""
+
+            if prefer == "listPrice":
+                return str(escolhido.get("listPrice") or escolhido.get("formatPrice") or "")
+            return str(escolhido.get("formatPrice") or escolhido.get("listPrice") or "")
+
+        if isinstance(parsed, dict):
+            if prefer == "listPrice":
+                return str(parsed.get("listPrice") or parsed.get("formatPrice") or "")
+            return str(parsed.get("formatPrice") or parsed.get("listPrice") or "")
+
+        return str(parsed).strip()
+
     def extract_result_fields(self, result):
         data = result.get("data", {}) or {}
 
@@ -393,7 +458,7 @@ class CotodigitalMkSpider(scrapy.Spider):
         if not preco:
             raw_p = data.get("price") or data.get("current_price") or ""
             if raw_p not in (None, ""):
-                preco = str(raw_p)
+                preco = self._simplificar_preco_saida(raw_p, prefer="formatPrice")
 
         if not preco_referencia:
             raw_pr = (
@@ -403,7 +468,7 @@ class CotodigitalMkSpider(scrapy.Spider):
                 or ""
             )
             if raw_pr not in (None, ""):
-                preco_referencia = str(raw_pr)
+                preco_referencia = self._simplificar_preco_saida(raw_pr, prefer="listPrice")
 
         return {
             "nome": data.get("product_name") or data.get("name") or result.get("value", "") or "",
@@ -423,8 +488,21 @@ class CotodigitalMkSpider(scrapy.Spider):
     def load_input_rows(self, file_path, sheet_name=None):
         path = Path(file_path)
 
+        if not path.is_absolute():
+            candidates = [
+                Path.cwd() / path,
+                Path(__file__).resolve().parent / path,
+                Path(__file__).resolve().parent.parent / path,
+                Path(__file__).resolve().parent.parent.parent / path,
+            ]
+            found = next((p for p in candidates if p.exists()), None)
+            if found:
+                path = found
+
         if not path.exists():
-            raise FileNotFoundError(f"Arquivo não encontrado: {path}")
+            raise FileNotFoundError(
+                f"Arquivo não encontrado: {file_path} | cwd={Path.cwd()}"
+            )
 
         suffix = path.suffix.lower()
 
