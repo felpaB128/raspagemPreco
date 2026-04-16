@@ -3,9 +3,22 @@ import csv
 from pathlib import Path
 
 
+def parse_desconto(valor):
+    valor = (valor or "").strip()
+    if not valor:
+        return 0.0
+
+    valor = valor.replace("%", "").replace(",", ".").strip()
+
+    try:
+        return float(valor)
+    except ValueError:
+        return 0.0
+
+
 def tem_desconto(row):
-    valor = (row.get("desconto_percentual") or "").strip()
-    return bool(valor)
+    desconto = parse_desconto(row.get("desconto_percentual"))
+    return desconto > 0
 
 
 def escrever_csv(caminho_saida: Path, fieldnames, rows):
@@ -29,41 +42,64 @@ def separar_promocoes_arquivo(
         if not reader.fieldnames:
             raise ValueError(f"[{csv_entrada.name}] CSV sem cabeçalho.")
 
+        fieldnames = reader.fieldnames
         rows_promocoes = []
         rows_sem_promocoes = []
+
+        tem_coluna_desconto = "desconto_percentual" in fieldnames
 
         for row in reader:
             if not any((v or "").strip() for v in row.values()):
                 continue
 
-            if tem_desconto(row):
-                rows_promocoes.append(row)
+            if tem_coluna_desconto:
+                if tem_desconto(row):
+                    rows_promocoes.append(row)
+                else:
+                    rows_sem_promocoes.append(row)
             else:
                 rows_sem_promocoes.append(row)
-
-        fieldnames = reader.fieldnames
 
     escrever_csv(csv_promocoes, fieldnames, rows_promocoes)
     escrever_csv(csv_sem_promocoes, fieldnames, rows_sem_promocoes)
 
-    print(
-        f"[{csv_entrada.name}] CSV promoções gerado: {csv_promocoes.resolve()} "
-        f"({len(rows_promocoes)} itens)"
-    )
-    print(
-        f"[{csv_entrada.name}] CSV sem promoções gerado: {csv_sem_promocoes.resolve()} "
-        f"({len(rows_sem_promocoes)} itens)"
-    )
+    if tem_coluna_desconto:
+        print(
+            f"[{csv_entrada.name}] CSV promoções gerado: {csv_promocoes.resolve()} "
+            f"({len(rows_promocoes)} itens)"
+        )
+        print(
+            f"[{csv_entrada.name}] CSV sem promoções gerado: {csv_sem_promocoes.resolve()} "
+            f"({len(rows_sem_promocoes)} itens)"
+        )
+    else:
+        print(
+            f"[{csv_entrada.name}] Coluna 'desconto_percentual' não encontrada. "
+            f"Todos os itens foram enviados para: {csv_sem_promocoes.resolve()} "
+            f"({len(rows_sem_promocoes)} itens)"
+        )
+        print(
+            f"[{csv_entrada.name}] CSV promoções gerado vazio: {csv_promocoes.resolve()} "
+            f"(0 itens)"
+        )
 
 
 def detectar_loja_pelo_nome_arquivo(nome_arquivo: str) -> str:
     nome = nome_arquivo.lower()
+
     if "carrefour" in nome:
         return "carrefour"
+    if "coto" in nome:
+        return "coto"
     if "jumbo" in nome:
         return "jumbo"
+    if "dia" in nome:
+        return "dia"
     if "masonline" in nome:
         return "masonline"
+    if "quarto_mercado" in nome:
+        return "quarto_mercado"
+
     return Path(nome_arquivo).stem
 
 
@@ -96,8 +132,13 @@ if __name__ == "__main__":
         "--inputs",
         "-i",
         nargs="+",
-        default=["carrefour_teste.csv", "jumbo_teste.csv", "masonline_teste.csv"],
-        help="Lista de CSVs de entrada (com coluna desconto_percentual)",
+        default=[
+            "coto_teste.csv",
+            "carrefour_teste.csv",
+            "dia_teste.csv",
+            "masonline_teste.csv",
+        ],
+        help="Lista de CSVs de entrada",
     )
     parser.add_argument(
         "--output-dir",

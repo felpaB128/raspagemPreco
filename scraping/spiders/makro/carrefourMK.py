@@ -92,7 +92,6 @@ class CarrefourMKSpider(Spider):
             if not row:
                 continue
 
-            # linha com algum valor não vazio
             if any(c is not None and str(c).strip() for c in row):
                 header_candidate = [str(c).strip().lower() if c is not None else "" for c in row]
 
@@ -110,6 +109,7 @@ class CarrefourMKSpider(Spider):
         header_normalizado = [h.lower() for h in header]
         nomes = {c: idx for idx, c in enumerate(header_normalizado)}
 
+        # coluna EAN
         idx_ean = (
             nomes.get("ean")
             or nomes.get("código ean")
@@ -130,10 +130,31 @@ class CarrefourMKSpider(Spider):
         if idx_ean is None:
             raise ValueError(f"Não encontrei coluna EAN no XLSX. Cabeçalho: {header}")
 
+        # tentar achar coluna do mercado/competidor
+        idx_mercado = None
+        candidatos_mercado = [
+            "competidor",
+            "competidor ",
+            "supermercado",
+            "mercado",
+            "cliente",
+        ]
+        for nome_coluna, idx in nomes.items():
+            if nome_coluna in candidatos_mercado:
+                idx_mercado = idx
+                break
+
         eans = []
         for row in rows[header_row_idx + 1:]:
             if row is None or idx_ean >= len(row):
                 continue
+
+            # se tiver coluna de mercado, filtra só Carrefour
+            if idx_mercado is not None and idx_mercado < len(row):
+                mercado_val = row[idx_mercado]
+                mercado_txt = str(mercado_val or "").lower()
+                if "carrefour" not in mercado_txt:
+                    continue
 
             valor = row[idx_ean]
             if valor is None:
@@ -143,8 +164,7 @@ class CarrefourMKSpider(Spider):
             if valor:
                 eans.append(valor)
 
-        # limita aos 50 primeiros
-        return list(dict.fromkeys(eans))[:50]
+        return list(dict.fromkeys(eans))
 
     def ler_eans_arquivo(self, arquivo_entrada):
         caminho = Path(arquivo_entrada)
@@ -159,7 +179,7 @@ class CarrefourMKSpider(Spider):
         else:
             raise ValueError("Use arquivo .csv ou .xlsx")
 
-        return eans[:50]
+        return eans
 
     # ---------------- utils ----------------
 

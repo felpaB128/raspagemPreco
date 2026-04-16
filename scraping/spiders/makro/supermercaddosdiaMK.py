@@ -57,6 +57,13 @@ class SupermercadosDiaMKSpider(Spider):
 
         return candidatos[0]
 
+    def _eh_competidor_dia(self, valor: str) -> bool:
+        if not valor:
+            return False
+        v = valor.strip().lower()
+        # ajuste aqui se na planilha o valor for, por exemplo, "DIA AR"
+        return "dia" in v
+
     def _ler_eans_csv(self, caminho: Path):
         eans = []
         with caminho.open("r", encoding="utf-8-sig", newline="") as f:
@@ -65,6 +72,7 @@ class SupermercadosDiaMKSpider(Spider):
                 raise ValueError("CSV sem cabeçalho.")
 
             nomes = {c.lower().strip(): c for c in reader.fieldnames}
+
             coluna_ean = (
                 nomes.get("ean")
                 or nomes.get("código ean")
@@ -81,7 +89,18 @@ class SupermercadosDiaMKSpider(Spider):
                     f"Não encontrei coluna de EAN no CSV. Cabeçalho: {reader.fieldnames}"
                 )
 
+            coluna_competidor = (
+                nomes.get("competidor")
+                or nomes.get("competidor ")
+                or nomes.get("concorrente")
+            )
+
             for row in reader:
+                if coluna_competidor:
+                    valor_comp = row.get(coluna_competidor) or ""
+                    if not self._eh_competidor_dia(valor_comp):
+                        continue
+
                 valor = (row.get(coluna_ean) or "").strip()
                 if valor:
                     eans.append(valor)
@@ -103,7 +122,6 @@ class SupermercadosDiaMKSpider(Spider):
         header_row_idx = None
         header = None
 
-        # tenta achar linha de cabeçalho "real"
         for idx, row in enumerate(rows[:20]):
             nomes_linha = [str(h).strip().lower() if h is not None else "" for h in row]
             if any(
@@ -124,7 +142,6 @@ class SupermercadosDiaMKSpider(Spider):
                 header = [str(h).strip() if h is not None else "" for h in row]
                 break
 
-        # fallback: primeira linha não vazia
         if header_row_idx is None:
             for idx, row in enumerate(rows):
                 if any(c is not None and str(c).strip() for c in row):
@@ -135,7 +152,7 @@ class SupermercadosDiaMKSpider(Spider):
         if header_row_idx is None or header is None:
             raise ValueError("Não encontrei nenhuma linha de cabeçalho na planilha.")
 
-        header_norm = [h.lower() for h in header]
+        header_norm = [h.lower().strip() for h in header]
         nomes = {c: idx for idx, c in enumerate(header_norm)}
 
         idx_ean = (
@@ -149,7 +166,8 @@ class SupermercadosDiaMKSpider(Spider):
             or nomes.get("cod_ean")
         )
 
-        # se ainda não encontrou, usa a primeira coluna não vazia
+        idx_competidor = nomes.get("competidor") or nomes.get("concorrente")
+
         if idx_ean is None:
             for i, h in enumerate(header):
                 if h:
@@ -163,8 +181,17 @@ class SupermercadosDiaMKSpider(Spider):
 
         eans = []
         for row in rows[header_row_idx + 1 :]:
-            if not row or idx_ean >= len(row):
+            if not row:
                 continue
+
+            if idx_competidor is not None and idx_competidor < len(row):
+                valor_comp = row[idx_competidor]
+                if not self._eh_competidor_dia(str(valor_comp) if valor_comp is not None else ""):
+                    continue
+
+            if idx_ean >= len(row):
+                continue
+
             valor = row[idx_ean]
             if valor is None:
                 continue
@@ -201,21 +228,59 @@ class SupermercadosDiaMKSpider(Spider):
             return Selector(text=browser_html)
         return response
 
-    def extrair_preco(self, texto: str):
+    def extrair_preco_regex(self, texto: str):
         if not texto:
             return None
 
         texto = " ".join(texto.split())
-        padroes = [
-            r"\$\s*\d{1,3}(?:\.\d{3})*(?:,\d{2})?",
+        padrao = r"\$\s*\d{1,3}(?:\.\d{3})*(?:,\d{2})?"
+
+        m = re.search(padrao, texto, flags=re.IGNORECASE)
+        if m:
+            return m.group(0)
+        return None
+
+    def extrair_preco_pdp(self, sel: Selector):
+        seletores = [
+            ".vtex-product-price-1-x-sellingPriceValue::text",
+            ".vtex-product-price-1-x-currencyContainer::text",
+            "[class*='sellingPriceValue']::text",
+            "[class*='currencyContainer']::text",
+            "[data-testid='price']::text",
         ]
 
-        for padrao in padroes:
-            m = re.search(padrao, texto, flags=re.IGNORECASE)
-            if m:
-                return m.group(0)
+        for s in seletores:
+            textos = sel.css(s).getall()
+            textos = [" ".join(t.split()) for t in textos if t and t.strip()]
+            for t in textos:
+                preco = self.extrair_preco_regex(t)
+                if preco:
+                    return preco
 
-        return None
+        textos = [t.strip() for t in sel.css("body ::text").getall() if t and t.strip()]
+        bloco = " ".join(textos)
+        return self.extrair_preco_regex(bloco)
+
+    def extrair_preco_card(self, card: Selector):
+        seletores = [
+            ".vtex-product-price-1-x-sellingPriceValue::text",
+            ".vtex-product-price-1-x-currencyContainer::text",
+            "[class*='sellingPriceValue']::text",
+            "[class*='currencyContainer']::text",
+            "[data-testid='price']::text",
+        ]
+
+        for s in seletores:
+            textos = card.css(s).getall()
+            textos = [" ".join(t.split()) for t in textos if t and t.strip()]
+            for t in textos:
+                preco = self.extrair_preco_regex(t)
+                if preco:
+                    return preco
+
+        textos = [t.strip() for t in card.css("::text").getall() if t and t.strip()]
+        bloco = " ".join(textos)
+        return self.extrair_preco_regex(bloco)
 
     def extrair_marca(self, nome):
         if not nome:
@@ -253,7 +318,7 @@ class SupermercadosDiaMKSpider(Spider):
             self.logger.info("Lendo arquivo de entrada: %s", caminho_resolvido)
 
             eans = self._ler_eans_arquivo(self.arquivo_entrada)[:50]
-            self.logger.info("Processando %d EANs do arquivo", len(eans))
+            self.logger.info("Processando %d EANs do arquivo (Competidor = DIA)", len(eans))
 
             for ean in eans:
                 yield Request(
@@ -300,7 +365,6 @@ class SupermercadosDiaMKSpider(Spider):
             "Busca %s | valor=%s | URL=%s", tipo_busca, busca_valor, response.url
         )
 
-        # 1) tentar achar links de produto na listagem
         links = sel.css("a::attr(href)").getall()
         links_produto = []
 
@@ -309,7 +373,6 @@ class SupermercadosDiaMKSpider(Spider):
                 continue
             href = href.strip()
 
-            # VTEX costuma usar /p no final para PDP
             if href.endswith("/p") or "/p?" in href or "/product/" in href.lower():
                 abs_url = response.urljoin(href)
                 if abs_url not in links_produto:
@@ -337,7 +400,6 @@ class SupermercadosDiaMKSpider(Spider):
                 )
             return
 
-        # 2) fallback: tentar usar informação da própria listagem
         cards = sel.css("article, section, div")
         encontrou_algo = False
 
@@ -347,12 +409,11 @@ class SupermercadosDiaMKSpider(Spider):
                 continue
 
             nome = self.extrair_nome_listagem(card)
-            textos = [t.strip() for t in card.css("::text").getall() if t and t.strip()]
-            bloco = " ".join(textos)
-            preco = self.extrair_preco(bloco)
+            preco = self.extrair_preco_card(card)
 
             if nome or preco:
                 encontrou_algo = True
+                status = "resultado_em_listagem_com_preco" if preco else "resultado_em_listagem_sem_preco"
                 yield {
                     "loja": "dia_ar",
                     "tipo_busca": tipo_busca,
@@ -362,11 +423,10 @@ class SupermercadosDiaMKSpider(Spider):
                     "marca": self.extrair_marca(nome),
                     "preco": preco,
                     "link": response.url,
-                    "status_busca": "resultado_em_listagem",
+                    "status_busca": status,
                 }
 
         if not encontrou_algo:
-            # 3) nada encontrado
             yield {
                 "loja": "dia_ar",
                 "tipo_busca": tipo_busca,
@@ -388,12 +448,10 @@ class SupermercadosDiaMKSpider(Spider):
         link = response.meta.get("link_produto")
         sel = self._get_selector(response)
 
-        # nome do produto: pega o primeiro h1 limpo da página
         nome = sel.css("h1::text").get()
         if nome:
             nome = " ".join(nome.split())
         else:
-            # fallback: tenta seletores específicos da VTEX
             nome = sel.css(
                 ".vtex-store-components-3-x-productNameContainer *::text, "
                 ".vtex-product-name-1-x-productName::text"
@@ -401,10 +459,8 @@ class SupermercadosDiaMKSpider(Spider):
             if nome:
                 nome = " ".join(nome.split())
 
-        # pegar todo o texto da página e extrair o primeiro preço
-        textos = [t.strip() for t in sel.css("body ::text").getall() if t and t.strip()]
-        bloco = " ".join(textos)
-        preco = self.extrair_preco(bloco)
+        preco = self.extrair_preco_pdp(sel)
+        status = "encontrado_com_preco" if preco else "encontrado_sem_preco"
 
         yield {
             "loja": "dia_ar",
@@ -415,5 +471,5 @@ class SupermercadosDiaMKSpider(Spider):
             "marca": self.extrair_marca(nome),
             "preco": preco,
             "link": link or response.url,
-            "status_busca": "encontrado",
+            "status_busca": status,
         }
