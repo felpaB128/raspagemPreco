@@ -1,0 +1,555 @@
+import base64
+import csv
+import re
+from pathlib import Path
+from urllib.parse import quote
+
+from scrapy import Spider, Request, Selector
+
+try:
+    import openpyxl
+except ImportError:
+    openpyxl = None
+
+
+SITES = {
+    "jumbo_ar": {
+        "base_url_busca": "https://www.jumbo.com.ar/busqueda?q={query}",
+        "allowed_domains": [
+            "www.jumbo.com.ar",
+            "jumbo.com.ar",
+        ],
+    },
+}
+
+
+class ProdutoPorEanSpider(Spider):
+    name = "produto_por_ean"
+
+    custom_settings = {
+        "ZYTE_API_TRANSPARENT_MODE": True,
+        "CONCURRENT_REQUESTS_PER_DOMAIN": 4,
+        "DOWNLOAD_DELAY": 0.2,
+        "LOG_LEVEL": "INFO",
+    }
+
+    def __init__(self, ean=None, arquivo_entrada=None, loja=None, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        loja = (loja or "").lower()
+
+        if loja not in SITES:
+            raise ValueError(
+                f"Loja '{loja}' não suportada. Use: {list(SITES.keys())}"
+            )
+
+        if not ean and not arquivo_entrada:
+            raise ValueError(
+                "Passe ean ou arquivo_entrada. "
+                "Ex.: -a ean=789... ou -a arquivo_entrada=seus_eans.csv/.xlsx"
+            )
+
+        self.ean = ean
+        self.arquivo_entrada = arquivo_entrada
+        self.loja = loja
+        self.site_cfg = SITES[loja]
+        self.allowed_domains = self.site_cfg["allowed_domains"]
+
+        self.prints_dir = Path("prints")
+        self.prints_dir.mkdir(exist_ok=True)
+
+    # ---------------- Leitura de EANs ----------------
+
+    def _ler_eans_csv(self, caminho: Path):
+        eans = []
+
+        with caminho.open("r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+
+            if not reader.fieldnames:
+                raise ValueError("CSV sem cabeçalho.")
+
+            nomes = {c.lower().strip(): c for c in reader.fieldnames}
+
+            coluna_ean = (
+                nomes.get("ean")
+                or nomes.get("código ean")
+                or nomes.get("codigo ean")
+                or nomes.get("codigo_ean")
+                or nomes.get("codigoean")
+                or nomes.get("ean 13")
+                or nomes.get("cod ean")
+                or nomes.get("cod_ean")
+            )
+
+            if not coluna_ean:
+                raise ValueError(
+                    f"Não encontrei coluna de EAN no CSV. Cabeçalho: {reader.fieldnames}"
+                )
+
+            for row in reader:
+                valor = (row.get(coluna_ean) or "").strip()
+                if valor:
+                    eans.append(valor)
+
+        if not eans:
+            self.logger.warning("Nenhum EAN lido do CSV %s", caminho)
+
+        return list(dict.fromkeys(eans))
+
+    def _ler_eans_xlsx(self, caminho: Path):
+        if openpyxl is None:
+            raise RuntimeError("openpyxl não está instalado. Rode: pip install openpyxl")
+
+        wb = openpyxl.load_workbook(str(caminho), read_only=True, data_only=True)
+        ws = wb[wb.sheetnames[0]]
+
+        rows = list(ws.iter_rows(values_only=True))
+        wb.close()
+
+        if not rows:
+            raise ValueError("Planilha vazia.")
+
+        header_row_idx = None
+        for i, row in enumerate(rows):
+            if row is None:
+                continue
+            valores = [str(c).strip() for c in row if c is not None and str(c).strip()]
+            if valores:
+                header_row_idx = i
+                break
+
+        if header_row_idx is None:
+            raise ValueError("Planilha sem dados.")
+
+        header = [str(h).strip() if h is not None else "" for h in rows[header_row_idx]]
+        header_normalizado = [h.strip().lower() for h in header]
+        nomes = {c: idx for idx, c in enumerate(header_normalizado)}
+
+        self.logger.info("Cabeçalho XLSX detectado: %s", header)
+
+        idx_ean = (
+            nomes.get("ean")
+            or nomes.get("código ean")
+            or nomes.get("codigo ean")
+            or nomes.get("codigo_ean")
+            or nomes.get("codigoean")
+            or nomes.get("ean 13")
+            or nomes.get("cod ean")
+            or nomes.get("cod_ean")
+        )
+
+        if idx_ean is None:
+            for nome_coluna, idx in nomes.items():
+                if "ean" in nome_coluna:
+                    idx_ean = idx
+                    break
+
+        if idx_ean is None:
+            raise ValueError(
+                "Não encontrei coluna de EAN no XLSX. "
+                f"Cabeçalho original: {header} | Cabeçalho normalizado: {header_normalizado}"
+            )
+
+        eans = []
+        for row in rows[header_row_idx + 1 :]:
+            if row is None:
+                continue
+            if all(c is None for c in row):
+                continue
+            if idx_ean >= len(row):
+                continue
+
+            valor = row[idx_ean]
+            if valor is None:
+                continue
+
+            valor_str = str(valor).strip()
+            if valor_str:
+                eans.append(valor_str)
+
+        if not eans:
+            self.logger.warning("Nenhum EAN lido do XLSX %s", caminho)
+
+        return list(dict.fromkeys(eans))
+
+    def _ler_eans_arquivo(self, caminho_str: str):
+        caminho = Path(caminho_str)
+
+        if not caminho.exists():
+            raise FileNotFoundError(f"Arquivo de entrada não encontrado: {caminho}")
+
+        sufixo = caminho.suffix.lower()
+
+        if sufixo == ".csv":
+            return self._ler_eans_csv(caminho)
+        elif sufixo == ".xlsx":
+            return self._ler_eans_xlsx(caminho)
+        else:
+            raise ValueError(
+                f"Extensão não suportada: {sufixo}. Use .csv ou .xlsx para arquivo_entrada."
+            )
+
+    # ---------------- Início do spider ----------------
+
+    def start_requests(self):
+        if self.arquivo_entrada:
+            eans = self._ler_eans_arquivo(self.arquivo_entrada)
+            self.logger.info(
+                "Lidos %d EAN(s) do arquivo %s", len(eans), self.arquivo_entrada
+            )
+
+            for ean in eans:
+                query_enc = quote(str(ean))
+                url = self.site_cfg["base_url_busca"].format(query=query_enc)
+
+                self.logger.info(
+                    "Agendando busca | loja=%s | ean=%s | url=%s",
+                    self.loja,
+                    ean,
+                    url,
+                )
+
+                yield Request(
+                    url=url,
+                    callback=self.parse_search,
+                    dont_filter=True,
+                    meta={
+                        "ean_atual": str(ean),
+                        "zyte_api_automap": {
+                            "browserHtml": True,
+                        },
+                    },
+                )
+            return
+
+        query_enc = quote(str(self.ean))
+        url = self.site_cfg["base_url_busca"].format(query=query_enc)
+
+        self.logger.info(
+            "Agendando busca única | loja=%s | ean=%s | url=%s",
+            self.loja,
+            self.ean,
+            url,
+        )
+
+        yield Request(
+            url=url,
+            callback=self.parse_search,
+            dont_filter=True,
+            meta={
+                "ean_atual": str(self.ean),
+                "zyte_api_automap": {
+                    "browserHtml": True,
+                },
+            },
+        )
+
+    # ---------------- Helpers de extração ----------------
+
+    def slugify(self, texto: str) -> str:
+        texto = (texto or "").strip().lower()
+        texto = re.sub(r"[^\w\s-]", "", texto, flags=re.UNICODE)
+        texto = re.sub(r"[-\s]+", "-", texto)
+        return (texto[:120] or "item").strip("-") or "item"
+
+    def extrair_preco(self, seletor):
+        if hasattr(seletor, "getall"):
+            textos = seletor.getall()
+        else:
+            textos = seletor.css("::text").getall()
+
+        bloco_texto = " ".join(t.strip() for t in textos if t and t.strip())
+
+        padroes = [
+            r"(R\$\s*\d{1,3}(?:\.\d{3})*,\d{2})",
+            r"(\$\s*\d{1,3}(?:\.\d{3})*,\d{2})",
+            r"(\$\s*\d{1,3}(?:\.\d{3})+)",
+            r"(\$\s*\d+,\d{2})",
+            r"(\$\s*\d+)",
+        ]
+
+        for padrao in padroes:
+            match = re.search(padrao, bloco_texto, flags=re.IGNORECASE)
+            if match:
+                return match.group(1)
+
+        return None
+
+    def extrair_desconto(self, seletor):
+        if hasattr(seletor, "getall"):
+            textos = seletor.getall()
+        else:
+            textos = seletor.css("::text").getall()
+
+        bloco_texto = " ".join(t.strip() for t in textos if t and t.strip())
+
+        m = re.search(r"(\d{1,3})\s*%", bloco_texto)
+        if m:
+            return m.group(1)
+        return None
+
+    def extrair_marca(self, nome_limpo: str):
+        palavras = (nome_limpo or "").split()
+        if not palavras:
+            return None
+
+        primeira = palavras[0].lower()
+
+        if primeira in ["geladeira", "refrigerador", "frigobar"] and len(palavras) > 1:
+            marca = palavras[1]
+        else:
+            marca = palavras[0]
+
+        if "electrolux" in nome_limpo.lower() and marca.lower() == "french":
+            marca = "Electrolux"
+
+        return marca
+
+    def salvar_screenshot(self, item, response):
+        raw = getattr(response, "raw_api_response", None) or {}
+        screenshot_b64 = raw.get("screenshot")
+
+        if not screenshot_b64:
+            return None
+
+        nome_arquivo = f"{self.slugify(item.get('nome') or 'item')}.png"
+        caminho_arquivo = self.prints_dir / nome_arquivo
+
+        with open(caminho_arquivo, "wb") as f:
+            f.write(base64.b64decode(screenshot_b64))
+
+        return str(caminho_arquivo.resolve())
+
+    def _get_html_selector(self, response):
+        raw = getattr(response, "raw_api_response", None) or {}
+        browser_html = raw.get("browserHtml")
+        if browser_html:
+            return Selector(text=browser_html)
+        return response
+
+    # ---------------- Lista de produtos ----------------
+
+    def obter_produtos_da_pagina(self, response):
+        response_sel = self._get_html_selector(response)
+
+        seletores_por_loja = {
+            "jumbo_ar": [
+                "article",
+                "[class*='product']",
+                "[class*='Product']",
+                "[class*='vtex-product-summary']",
+                "a[href*='/p']",
+            ],
+        }
+
+        lista = seletores_por_loja.get(self.loja, ["article", "[class*='product']"])
+        vistos = []
+        chaves_vistas = set()
+
+        for seletor in lista:
+            for node in response_sel.css(seletor):
+                href = node.css("a::attr(href), ::attr(href)").get()
+                textos = node.css("::text").getall()
+                texto_base = "".join(textos[:3]).strip() if textos else ""
+                chave = f"{href or ''}|{texto_base}"
+
+                if chave not in chaves_vistas:
+                    chaves_vistas.add(chave)
+                    vistos.append(node)
+
+        return vistos
+
+    def extrair_nome_produto_lista(self, produto):
+        seletores_nome = [
+            "h1::text",
+            "h2::text",
+            "h3::text",
+            "h4::text",
+            "a::text",
+            "[class*='name']::text",
+            "[class*='title']::text",
+            "[class*='brand']::text",
+        ]
+
+        for seletor in seletores_nome:
+            nome = produto.css(seletor).get()
+            if nome and nome.strip():
+                nome_limpo = " ".join(nome.split())
+                if nome_limpo and len(nome_limpo) > 2:
+                    return nome_limpo
+
+        textos = produto.css("::text").getall()
+        textos_limpos = [t.strip() for t in textos if t and t.strip()]
+        for txt in textos_limpos:
+            if len(txt) > 2 and txt.lower() not in {"patrocinado", "sponsored"}:
+                return " ".join(txt.split())
+
+        return None
+
+    def extrair_link_produto_lista(self, produto, response):
+        response_sel = self._get_html_selector(response)
+        seletores_link = [
+            "a[href*='/producto/']::attr(href)",
+            "a[href*='/p/']::attr(href)",
+            "a[href*='/p']::attr(href)",
+            "a::attr(href)",
+            "::attr(href)",
+        ]
+
+        for seletor in seletores_link:
+            link = produto.css(seletor).get()
+            if link:
+                return response_sel.urljoin(link)
+
+        return None
+
+    def extrair_next_page(self, response):
+        response_sel = self._get_html_selector(response)
+        seletores = [
+            "a[rel='next']::attr(href)",
+            "a[aria-label*='Próxima']::attr(href)",
+            "a[aria-label*='Next']::attr(href)",
+            "a[aria-label*='Siguiente']::attr(href)",
+            "a[title*='Next']::attr(href)",
+            "a[title*='Siguiente']::attr(href)",
+            ".pagination a.next::attr(href)",
+            "li.next a::attr(href)",
+        ]
+
+        for seletor in seletores:
+            next_page = response_sel.css(seletor).get()
+            if next_page:
+                return next_page
+
+        return None
+
+    # ---------------- Callbacks ----------------
+
+    def parse_search(self, response):
+        ean_atual = response.meta.get("ean_atual") or self.ean
+
+        self.logger.info(
+            "Loja: %s | EAN: %s | URL: %s",
+            self.loja,
+            ean_atual,
+            response.url,
+        )
+
+        if response.status == 404:
+            self.logger.info("EAN %s retornou 404 em %s", ean_atual, self.loja)
+            return
+
+        produtos = self.obter_produtos_da_pagina(response)
+        self.logger.info("Produtos encontrados na página: %s", len(produtos))
+
+        if not produtos:
+            raw = getattr(response, "raw_api_response", None) or {}
+            browser_html = raw.get("browserHtml") or response.text
+            self.logger.debug("HTML (primeiros 2000 chars): %s", browser_html[:2000])
+
+        for produto in produtos:
+            nome_limpo = self.extrair_nome_produto_lista(produto)
+
+            if not nome_limpo:
+                continue
+
+            if nome_limpo.lower() in {"patrocinado", "sponsored"}:
+                continue
+
+            preco_lista = self.extrair_preco(produto)
+            desconto_percentual_lista = self.extrair_desconto(produto)
+            marca_lista = self.extrair_marca(nome_limpo)
+            link_absoluto = self.extrair_link_produto_lista(produto, response)
+
+            if not link_absoluto:
+                self.logger.debug("Produto sem link: %r", nome_limpo)
+                continue
+
+            item_base = {
+                "loja": self.loja,
+                "ean": ean_atual,
+                "nome": nome_limpo,
+                "marca": marca_lista,
+                "preco": preco_lista,
+                "desconto_percentual": desconto_percentual_lista,
+                "print_tela_path": None,
+                "link": link_absoluto,
+            }
+
+            self.logger.info("Enfileirando parse_produto: %s", link_absoluto)
+
+            yield Request(
+                url=link_absoluto,
+                callback=self.parse_produto,
+                dont_filter=True,
+                meta={
+                    "item_base": item_base,
+                    "zyte_api_automap": {
+                        "browserHtml": True,
+                        "screenshot": True,
+                    },
+                },
+            )
+
+        next_page = self.extrair_next_page(response)
+        if next_page:
+            self.logger.info("Encontrada paginação, seguindo para %s", next_page)
+            yield response.follow(
+                next_page,
+                callback=self.parse_search,
+                dont_filter=True,
+                meta={
+                    "ean_atual": ean_atual,
+                    "zyte_api_automap": {
+                        "browserHtml": True,
+                    },
+                },
+            )
+
+    def parse_produto(self, response):
+        self.logger.info("Entrou em parse_produto: %s", response.url)
+
+        response_sel = self._get_html_selector(response)
+        item = response.meta["item_base"].copy()
+
+        nome_pagina = response_sel.css(
+            "h1::text, [class*='product'] h1::text, [class*='title']::text"
+        ).get()
+
+        if nome_pagina:
+            item["nome"] = " ".join(nome_pagina.split())
+
+        textos = response_sel.css("body ::text").getall()
+        bloco_texto = " ".join(t.strip() for t in textos if t and t.strip())
+
+        if not item.get("preco"):
+            padroes_preco = [
+                r"(R\$\s*\d{1,3}(?:\.\d{3})*,\d{2})",
+                r"(\$\s*\d{1,3}(?:\.\d{3})*,\d{2})",
+                r"(\$\s*\d{1,3}(?:\.\d{3})+)",
+                r"(\$\s*\d+,\d{2})",
+                r"(\$\s*\d+)",
+            ]
+            for padrao in padroes_preco:
+                m_preco = re.search(padrao, bloco_texto)
+                if m_preco:
+                    item["preco"] = m_preco.group(1)
+                    break
+
+        if not item.get("desconto_percentual"):
+            m_desc = re.search(r"(\d{1,3})\s*%", bloco_texto)
+            if m_desc:
+                item["desconto_percentual"] = m_desc.group(1)
+
+        if not item.get("marca") and item.get("nome"):
+            item["marca"] = self.extrair_marca(item["nome"])
+
+        try:
+            item["print_tela_path"] = self.salvar_screenshot(item, response)
+        except Exception as e:
+            self.logger.error("Erro ao salvar screenshot de %s: %s", response.url, e)
+            item["print_tela_path"] = None
+
+        self.logger.info("Emitindo item: %r", item)
+        yield item

@@ -86,7 +86,6 @@ class CarrefourMKSpider(Spider):
         if not rows:
             raise ValueError("Planilha vazia.")
 
-        # achar linha de cabeçalho, ignorando linhas de título tipo "RELEVAMIENTO MENSUAL"
         header_row_idx = None
         for i, row in enumerate(rows):
             if not row:
@@ -94,11 +93,8 @@ class CarrefourMKSpider(Spider):
 
             if any(c is not None and str(c).strip() for c in row):
                 header_candidate = [str(c).strip().lower() if c is not None else "" for c in row]
-
-                # se não tem "ean" em nenhuma célula, provavelmente é título -> continua procurando
                 if not any("ean" in h for h in header_candidate):
                     continue
-
                 header_row_idx = i
                 break
 
@@ -109,17 +105,14 @@ class CarrefourMKSpider(Spider):
         header_normalizado = [h.lower() for h in header]
         nomes = {c: idx for idx, c in enumerate(header_normalizado)}
 
-        # coluna EAN
-        idx_ean = (
-            nomes.get("ean")
-            or nomes.get("código ean")
-            or nomes.get("codigo ean")
-            or nomes.get("codigo_ean")
-            or nomes.get("codigoean")
-            or nomes.get("ean 13")
-            or nomes.get("cod ean")
-            or nomes.get("cod_ean")
-        )
+        idx_ean = None
+        for chave in [
+            "ean", "código ean", "codigo ean", "codigo_ean",
+            "codigoean", "ean 13", "cod ean", "cod_ean"
+        ]:
+            if chave in nomes:
+                idx_ean = nomes[chave]
+                break
 
         if idx_ean is None:
             for nome_coluna, idx in nomes.items():
@@ -130,7 +123,6 @@ class CarrefourMKSpider(Spider):
         if idx_ean is None:
             raise ValueError(f"Não encontrei coluna EAN no XLSX. Cabeçalho: {header}")
 
-        # tentar achar coluna do mercado/competidor
         idx_mercado = None
         candidatos_mercado = [
             "competidor",
@@ -149,7 +141,6 @@ class CarrefourMKSpider(Spider):
             if row is None or idx_ean >= len(row):
                 continue
 
-            # se tiver coluna de mercado, filtra só Carrefour
             if idx_mercado is not None and idx_mercado < len(row):
                 mercado_val = row[idx_mercado]
                 mercado_txt = str(mercado_val or "").lower()
@@ -245,11 +236,13 @@ class CarrefourMKSpider(Spider):
 
         for seller in sellers:
             offer = seller.get("commertialOffer") or {}
-            preco = offer.get("Price")
-            if preco is None:
-                preco = offer.get("spotPrice")
-            if preco is None:
-                preco = offer.get("ListPrice")
+
+            preco = (
+                offer.get("Price")
+                or offer.get("spotPrice")
+                or offer.get("ListPrice")
+                or offer.get("PriceWithoutDiscount")
+            )
 
             if preco is None:
                 continue
@@ -277,6 +270,37 @@ class CarrefourMKSpider(Spider):
         base = url.split("?")[0]
         return base.endswith("/p") or "/p/" in base or base.endswith("/p")
 
+    def normalize_prices(self, preco=None, preco_por=None, preco_de=None):
+        preco = self.parse_price(preco)
+        preco_por = self.parse_price(preco_por)
+        preco_de = self.parse_price(preco_de)
+
+        if preco_por is not None and preco_de is not None and preco_de > preco_por:
+            return {
+                "preco": preco_por,
+                "precoPor": preco_por,
+                "precoDe": preco_de,
+                "oferta": "x",
+            }
+
+        preco_final = preco_por if preco_por is not None else preco_de if preco_de is not None else preco
+
+        return {
+            "preco": preco_final,
+            "precoPor": None,
+            "precoDe": None,
+            "oferta": None,
+        }
+
+    def apply_price_rules(self, item):
+        normalized = self.normalize_prices(
+            preco=item.get("preco"),
+            preco_por=item.get("precoPor"),
+            preco_de=item.get("precoDe"),
+        )
+        item.update(normalized)
+        return item
+
     def extract_items_from_api_product(self, produto, ean, response):
         product_name = (
             produto.get("productName")
@@ -290,6 +314,8 @@ class CarrefourMKSpider(Spider):
             link = response.urljoin(link)
 
         preco = None
+        preco_por = None
+        preco_de = None
         sku_ean = None
 
         items = produto.get("items") or []
@@ -314,11 +340,18 @@ class CarrefourMKSpider(Spider):
             seller = self.pick_best_seller(sellers)
             if seller:
                 offer = seller.get("commertialOffer") or {}
-                preco = (
+
+                preco_por = (
                     offer.get("Price")
                     or offer.get("spotPrice")
+                )
+
+                preco_de = (
+                    offer.get("PriceWithoutDiscount")
                     or offer.get("ListPrice")
                 )
+
+                preco = preco_por or preco_de
 
             item_link = item_match.get("detailUrl")
             if item_link and item_link.startswith("/"):
@@ -327,15 +360,19 @@ class CarrefourMKSpider(Spider):
             if item_link:
                 link = item_link
 
-        return {
+        item = {
             "ean": ean,
             "nome": self.clean_nome(product_name, ean),
             "marca": self.normalize_text(brand),
-            "preco": self.parse_price(preco),
+            "preco": preco,
+            "precoPor": preco_por,
+            "precoDe": preco_de,
+            "oferta": None,
             "loja": "carrefour_ar",
             "link": link,
             "sku_ean_encontrado": sku_ean,
         }
+        return self.apply_price_rules(item)
 
     # ---------------- start ----------------
 
@@ -359,6 +396,9 @@ class CarrefourMKSpider(Spider):
                     "nome": None,
                     "marca": None,
                     "preco": None,
+                    "precoPor": None,
+                    "precoDe": None,
+                    "oferta": None,
                     "loja": "carrefour_ar",
                     "link": None,
                 }
@@ -393,8 +433,8 @@ class CarrefourMKSpider(Spider):
             item = self.extract_items_from_api_product(data[0], ean, response)
 
             self.logger.info(
-                "API EAN FINAL | EAN=%s | nome=%s | preco=%s | link=%s",
-                item["ean"], item["nome"], item["preco"], item["link"]
+                "API EAN FINAL | EAN=%s | nome=%s | preco=%s | precoPor=%s | precoDe=%s | oferta=%s | link=%s",
+                item["ean"], item["nome"], item["preco"], item["precoPor"], item["precoDe"], item["oferta"], item["link"]
             )
 
             if item["link"] and self.is_pdp_url(item["link"]):
@@ -416,7 +456,7 @@ class CarrefourMKSpider(Spider):
                 return
 
             item.pop("sku_ean_encontrado", None)
-            yield item
+            yield self.apply_price_rules(item)
             return
 
         self.logger.warning("API EAN sem resultados para EAN=%s", ean)
@@ -474,8 +514,8 @@ class CarrefourMKSpider(Spider):
 
             if melhor:
                 self.logger.info(
-                    "API FT FINAL | EAN=%s | nome=%s | preco=%s | link=%s",
-                    melhor["ean"], melhor["nome"], melhor["preco"], melhor["link"]
+                    "API FT FINAL | EAN=%s | nome=%s | preco=%s | precoPor=%s | precoDe=%s | oferta=%s | link=%s",
+                    melhor["ean"], melhor["nome"], melhor["preco"], melhor["precoPor"], melhor["precoDe"], melhor["oferta"], melhor["link"]
                 )
 
                 melhor.pop("_score", None)
@@ -499,7 +539,7 @@ class CarrefourMKSpider(Spider):
                     )
                     return
 
-                yield melhor
+                yield self.apply_price_rules(melhor)
                 return
 
         self.logger.warning("API FT sem resultados para EAN=%s", ean)
@@ -547,6 +587,9 @@ class CarrefourMKSpider(Spider):
                         "nome": None,
                         "marca": None,
                         "preco": None,
+                        "precoPor": None,
+                        "precoDe": None,
+                        "oferta": None,
                         "loja": "carrefour_ar",
                         "link": links_validos[0],
                     },
@@ -596,6 +639,9 @@ class CarrefourMKSpider(Spider):
                 "nome": None,
                 "marca": None,
                 "preco": None,
+                "precoPor": None,
+                "precoDe": None,
+                "oferta": None,
                 "loja": "carrefour_ar",
                 "link": response.url,
             }
@@ -614,7 +660,6 @@ class CarrefourMKSpider(Spider):
                         const texto = normalizar(el.textContent || '');
                         if (!texto) continue;
 
-                        const textoDigitos = soDigitos(texto);
                         const hrefEl = el.matches('a[href*="/p"]') ? el : el.querySelector('a[href*="/p"]');
                         const href = hrefEl ? hrefEl.href : null;
 
@@ -622,7 +667,7 @@ class CarrefourMKSpider(Spider):
                         const html = el.outerHTML || '';
 
                         const bateEan =
-                            textoDigitos.includes(ean) ||
+                            soDigitos(texto).includes(ean) ||
                             soDigitos(datasetStr).includes(ean) ||
                             soDigitos(html).includes(ean);
 
@@ -636,6 +681,7 @@ class CarrefourMKSpider(Spider):
                             el.querySelector('span');
 
                         const precoEl =
+                            el.querySelector('.valtech-carrefourar-product-price-0-x-sellingPriceValue .valtech-carrefourar-product-price-0-x-currencyContainer') ||
                             el.querySelector('.valtech-carrefourar-product-price-0-x-currencyContainer') ||
                             el.querySelector('[class*="price"]') ||
                             el.querySelector('[data-testid*="price"]');
@@ -672,6 +718,9 @@ class CarrefourMKSpider(Spider):
                 "nome": None,
                 "marca": None,
                 "preco": None,
+                "precoPor": None,
+                "precoDe": None,
+                "oferta": None,
                 "loja": "carrefour_ar",
                 "link": response.url,
             }
@@ -698,6 +747,9 @@ class CarrefourMKSpider(Spider):
                         "nome": nome,
                         "marca": None,
                         "preco": preco,
+                        "precoPor": None,
+                        "precoDe": None,
+                        "oferta": None,
                         "loja": "carrefour_ar",
                         "link": link,
                     },
@@ -711,14 +763,18 @@ class CarrefourMKSpider(Spider):
             )
             return
 
-        yield {
+        item = {
             "ean": ean,
             "nome": nome,
             "marca": None,
             "preco": preco,
+            "precoPor": None,
+            "precoDe": None,
+            "oferta": None,
             "loja": "carrefour_ar",
             "link": link or response.url,
         }
+        yield self.apply_price_rules(item)
 
     # ---------------- PDP ----------------
 
@@ -731,14 +787,18 @@ class CarrefourMKSpider(Spider):
             self.logger.warning("URL de promo genérica ignorada | EAN=%s | URL=%s", ean, response.url)
             if page:
                 await page.close()
-            yield {
+            item = {
                 "ean": ean,
                 "nome": base.get("nome"),
                 "marca": base.get("marca"),
                 "preco": base.get("preco"),
+                "precoPor": None,
+                "precoDe": None,
+                "oferta": None,
                 "loja": "carrefour_ar",
                 "link": response.url,
             }
+            yield self.apply_price_rules(item)
             return
 
         nome = (
@@ -757,30 +817,94 @@ class CarrefourMKSpider(Spider):
         marca = self.normalize_text(marca)
 
         preco = base.get("preco")
+        preco_por = base.get("precoPor")
+        preco_de = base.get("precoDe")
 
-        partes_preco = response.css(
+        partes_preco_por = response.css(
+            ".valtech-carrefourar-product-price-0-x-sellingPriceValue "
             ".valtech-carrefourar-product-price-0-x-currencyContainer *::text"
         ).getall()
-        texto_preco = "".join(p.strip() for p in partes_preco if p.strip()) or None
-        if texto_preco:
-            preco = self.parse_price(texto_preco)
+        texto_preco_por = "".join(p.strip() for p in partes_preco_por if p.strip()) or None
 
-        if page and preco is None:
+        if texto_preco_por:
+            preco_por = self.parse_price(texto_preco_por)
+
+        partes_preco_de = response.css(
+            ".valtech-carrefourar-product-price-0-x-listPriceValue "
+            ".valtech-carrefourar-product-price-0-x-currencyContainer *::text"
+        ).getall()
+        texto_preco_de = "".join(p.strip() for p in partes_preco_de if p.strip()) or None
+
+        if texto_preco_de:
+            preco_de = self.parse_price(texto_preco_de)
+
+        if preco_de is None:
+            possiveis_seletores_preco_de = [
+                '.valtech-carrefourar-product-price-0-x-listPriceValue *::text',
+                '.valtech-carrefourar-product-price-0-x-listPrice *::text',
+                '[class*="listPrice"] *::text',
+                '[class*="list-price"] *::text',
+                '[class*="strike"] *::text',
+                'span[style*="line-through"]::text',
+            ]
+            for seletor in possiveis_seletores_preco_de:
+                partes = response.css(seletor).getall()
+                txt = "".join(p.strip() for p in partes if p.strip()) or None
+                if txt:
+                    preco_de = self.parse_price(txt)
+                    if preco_de is not None:
+                        break
+
+        if page and (preco_por is None or preco_de is None):
             try:
-                texto_js = await page.evaluate(
+                precos_js = await page.evaluate(
                     """() => {
-                        const el =
-                            document.querySelector('.valtech-carrefourar-product-price-0-x-currencyContainer') ||
-                            document.querySelector('[class*="price"]');
-                        return el ? el.textContent.trim() : null;
+                        const normalizar = (txt) => (txt || '').replace(/\\s+/g, ' ').trim();
+
+                        const pegarTexto = (seletores) => {
+                            for (const s of seletores) {
+                                const el = document.querySelector(s);
+                                if (el && el.textContent && el.textContent.trim()) {
+                                    return normalizar(el.textContent);
+                                }
+                            }
+                            return null;
+                        };
+
+                        const precoPor = pegarTexto([
+                            '.valtech-carrefourar-product-price-0-x-sellingPriceValue .valtech-carrefourar-product-price-0-x-currencyContainer',
+                            '.valtech-carrefourar-product-price-0-x-sellingPriceValue',
+                            '.valtech-carrefourar-product-price-0-x-sellingPrice',
+                            '[class*="sellingPrice"]',
+                            '[class*="spotPrice"]'
+                        ]);
+
+                        const precoDe = pegarTexto([
+                            '.valtech-carrefourar-product-price-0-x-listPriceValue .valtech-carrefourar-product-price-0-x-currencyContainer',
+                            '.valtech-carrefourar-product-price-0-x-listPriceValue',
+                            '.valtech-carrefourar-product-price-0-x-listPrice',
+                            '[class*="listPrice"]',
+                            '[class*="list-price"]',
+                            '[class*="strike"]',
+                            'span[style*="line-through"]'
+                        ]);
+
+                        return { precoPor, precoDe };
                     }"""
                 )
-                if texto_js:
-                    preco = self.parse_price(texto_js)
+
+                if precos_js:
+                    if preco_por is None and precos_js.get("precoPor"):
+                        preco_por = self.parse_price(precos_js.get("precoPor"))
+                    if preco_de is None and precos_js.get("precoDe"):
+                        preco_de = self.parse_price(precos_js.get("precoDe"))
             except Exception as exc:
-                self.logger.warning("Falha ao ler preço via Playwright | EAN=%s | erro=%s", ean, exc)
+                self.logger.warning("Falha ao ler preços via Playwright | EAN=%s | erro=%s", ean, exc)
 
         if preco is None:
+            preco = preco_por or preco_de or base.get("preco")
+
+        if (preco_por is None or preco_de is None):
             for bloco in response.css('script[type="application/ld+json"]::text').getall():
                 try:
                     data = json.loads(bloco)
@@ -806,18 +930,31 @@ class CarrefourMKSpider(Spider):
                     if isinstance(offers, list):
                         offers = offers[0] if offers else {}
 
-                    preco = (
-                        preco
-                        or obj.get("price")
+                    preco_json = (
+                        obj.get("price")
                         or offers.get("price")
                         or offers.get("lowPrice")
                         or offers.get("highPrice")
                     )
 
-                    if preco is not None:
-                        break
+                    list_price_json = None
+                    if isinstance(offers, dict):
+                        list_price_json = (
+                            offers.get("listPrice")
+                            or offers.get("priceSpecification", {}).get("price")
+                            if isinstance(offers.get("priceSpecification"), dict)
+                            else None
+                        )
 
-                if preco is not None:
+                    if preco_por is None and preco_json is not None:
+                        preco_por = self.parse_price(preco_json)
+
+                    if preco_de is None and list_price_json is not None:
+                        preco_de = self.parse_price(list_price_json)
+
+                    break
+
+                if preco_por is not None or preco_de is not None:
                     break
 
         if page:
@@ -827,14 +964,19 @@ class CarrefourMKSpider(Spider):
             "ean": ean,
             "nome": nome,
             "marca": marca,
-            "preco": self.parse_price(preco),
+            "preco": preco,
+            "precoPor": preco_por,
+            "precoDe": preco_de,
+            "oferta": None,
             "loja": "carrefour_ar",
             "link": response.url,
         }
 
+        item = self.apply_price_rules(item)
+
         self.logger.info(
-            "PDP FINAL | EAN=%s | nome=%s | preco=%s | link=%s",
-            item["ean"], item["nome"], item["preco"], item["link"]
+            "PDP FINAL | EAN=%s | nome=%s | preco=%s | precoPor=%s | precoDe=%s | oferta=%s | link=%s",
+            item["ean"], item["nome"], item["preco"], item["precoPor"], item["precoDe"], item["oferta"], item["link"]
         )
 
         yield item

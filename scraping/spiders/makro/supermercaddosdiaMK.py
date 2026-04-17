@@ -61,7 +61,6 @@ class SupermercadosDiaMKSpider(Spider):
         if not valor:
             return False
         v = valor.strip().lower()
-        # ajuste aqui se na planilha o valor for, por exemplo, "DIA AR"
         return "dia" in v
 
     def _ler_eans_csv(self, caminho: Path):
@@ -125,8 +124,7 @@ class SupermercadosDiaMKSpider(Spider):
         for idx, row in enumerate(rows[:20]):
             nomes_linha = [str(h).strip().lower() if h is not None else "" for h in row]
             if any(
-                n
-                in (
+                n in (
                     "ean",
                     "código ean",
                     "codigo ean",
@@ -155,24 +153,26 @@ class SupermercadosDiaMKSpider(Spider):
         header_norm = [h.lower().strip() for h in header]
         nomes = {c: idx for idx, c in enumerate(header_norm)}
 
-        idx_ean = (
-            nomes.get("ean")
-            or nomes.get("código ean")
-            or nomes.get("codigo ean")
-            or nomes.get("codigo_ean")
-            or nomes.get("codigoean")
-            or nomes.get("ean 13")
-            or nomes.get("cod ean")
-            or nomes.get("cod_ean")
-        )
+        idx_ean = None
+        for chave in (
+            "ean",
+            "código ean",
+            "codigo ean",
+            "codigo_ean",
+            "codigoean",
+            "ean 13",
+            "cod ean",
+            "cod_ean",
+        ):
+            if chave in nomes:
+                idx_ean = nomes[chave]
+                break
 
-        idx_competidor = nomes.get("competidor") or nomes.get("concorrente")
-
-        if idx_ean is None:
-            for i, h in enumerate(header):
-                if h:
-                    idx_ean = i
-                    break
+        idx_competidor = None
+        for chave in ("competidor", "concorrente"):
+            if chave in nomes:
+                idx_competidor = nomes[chave]
+                break
 
         if idx_ean is None:
             raise ValueError(
@@ -180,7 +180,7 @@ class SupermercadosDiaMKSpider(Spider):
             )
 
         eans = []
-        for row in rows[header_row_idx + 1 :]:
+        for row in rows[header_row_idx + 1:]:
             if not row:
                 continue
 
@@ -195,6 +195,7 @@ class SupermercadosDiaMKSpider(Spider):
             valor = row[idx_ean]
             if valor is None:
                 continue
+
             valor = str(valor).strip()
             if valor:
                 eans.append(valor)
@@ -228,6 +229,66 @@ class SupermercadosDiaMKSpider(Spider):
             return Selector(text=browser_html)
         return response
 
+    def _to_float(self, valor):
+        if valor is None:
+            return None
+
+        if isinstance(valor, (int, float)):
+            return float(valor)
+
+        texto = str(valor).strip()
+        if not texto:
+            return None
+
+        texto = texto.replace("$", "").replace("\xa0", " ")
+        texto = texto.replace(".", "").replace(",", ".")
+        texto = re.sub(r"[^\d.]", "", texto)
+
+        try:
+            return float(texto) if texto else None
+        except Exception:
+            return None
+
+    def _price_to_str(self, valor):
+        if valor is None:
+            return None
+        if float(valor).is_integer():
+            return str(int(valor))
+        return f"{valor:.2f}"
+
+    def aplicar_oferta_flag(self, preco_por, preco_de):
+        preco_por_f = self._to_float(preco_por)
+        preco_de_f = self._to_float(preco_de)
+
+        if preco_por_f is not None and preco_de_f is not None and preco_de_f > preco_por_f:
+            return "x"
+        return None
+
+    def normalizar_precos(self, preco=None, preco_por=None, preco_de=None):
+        preco_f = self._to_float(preco)
+        preco_por_f = self._to_float(preco_por)
+        preco_de_f = self._to_float(preco_de)
+
+        if preco_por_f is None and preco_f is not None:
+            preco_por_f = preco_f
+
+        oferta = None
+
+        if preco_por_f is not None and preco_de_f is not None and preco_de_f > preco_por_f:
+            preco_final = preco_por_f
+            oferta = "x"
+        else:
+            preco_final = preco_por_f if preco_por_f is not None else preco_de_f
+            preco_por_f = None
+            preco_de_f = None
+
+        return {
+            "preco": self._price_to_str(preco_final),
+            "precoPor": self._price_to_str(preco_por_f),
+            "precoDe": self._price_to_str(preco_de_f),
+            "oferta": oferta,
+        }
+
     def extrair_preco_regex(self, texto: str):
         if not texto:
             return None
@@ -240,47 +301,115 @@ class SupermercadosDiaMKSpider(Spider):
             return m.group(0)
         return None
 
-    def extrair_preco_pdp(self, sel: Selector):
-        seletores = [
+    def extrair_todos_precos_regex(self, texto: str):
+        if not texto:
+            return []
+
+        texto = " ".join(texto.split())
+        padrao = r"\$\s*\d{1,3}(?:\.\d{3})*(?:,\d{2})?"
+        return re.findall(padrao, texto, flags=re.IGNORECASE)
+
+    def extrair_precos_pdp(self, sel: Selector):
+        preco_por = None
+        preco_de = None
+
+        seletores_preco_por = [
             ".vtex-product-price-1-x-sellingPriceValue::text",
-            ".vtex-product-price-1-x-currencyContainer::text",
+            ".vtex-product-price-1-x-currencyContainer .vtex-product-price-1-x-sellingPriceValue::text",
             "[class*='sellingPriceValue']::text",
-            "[class*='currencyContainer']::text",
             "[data-testid='price']::text",
         ]
 
-        for s in seletores:
+        seletores_preco_de = [
+            ".vtex-product-price-1-x-listPriceValue::text",
+            "[class*='listPriceValue']::text",
+            "[class*='listPrice']::text",
+        ]
+
+        for s in seletores_preco_por:
             textos = sel.css(s).getall()
             textos = [" ".join(t.split()) for t in textos if t and t.strip()]
             for t in textos:
                 preco = self.extrair_preco_regex(t)
                 if preco:
-                    return preco
+                    preco_por = preco
+                    break
+            if preco_por:
+                break
 
-        textos = [t.strip() for t in sel.css("body ::text").getall() if t and t.strip()]
-        bloco = " ".join(textos)
-        return self.extrair_preco_regex(bloco)
+        for s in seletores_preco_de:
+            textos = sel.css(s).getall()
+            textos = [" ".join(t.split()) for t in textos if t and t.strip()]
+            for t in textos:
+                preco = self.extrair_preco_regex(t)
+                if preco:
+                    preco_de = preco
+                    break
+            if preco_de:
+                break
 
-    def extrair_preco_card(self, card: Selector):
-        seletores = [
+        if not preco_por:
+            textos = [t.strip() for t in sel.css("body ::text").getall() if t and t.strip()]
+            bloco = " ".join(textos)
+            precos = self.extrair_todos_precos_regex(bloco)
+            if precos:
+                preco_por = precos[0]
+                if len(precos) > 1:
+                    preco_de = preco_de or precos[1]
+
+        return self.normalizar_precos(preco=preco_por, preco_por=preco_por, preco_de=preco_de)
+
+    def extrair_precos_card(self, card: Selector):
+        preco_por = None
+        preco_de = None
+
+        seletores_preco_por = [
             ".vtex-product-price-1-x-sellingPriceValue::text",
-            ".vtex-product-price-1-x-currencyContainer::text",
+            ".vtex-product-price-1-x-currencyContainer .vtex-product-price-1-x-sellingPriceValue::text",
             "[class*='sellingPriceValue']::text",
-            "[class*='currencyContainer']::text",
             "[data-testid='price']::text",
+            ".vtex-product-price-1-x-currencyContainer::text",
+            "[class*='currencyContainer']::text",
         ]
 
-        for s in seletores:
+        seletores_preco_de = [
+            ".vtex-product-price-1-x-listPriceValue::text",
+            "[class*='listPriceValue']::text",
+            "[class*='listPrice']::text",
+        ]
+
+        for s in seletores_preco_por:
             textos = card.css(s).getall()
             textos = [" ".join(t.split()) for t in textos if t and t.strip()]
             for t in textos:
                 preco = self.extrair_preco_regex(t)
                 if preco:
-                    return preco
+                    preco_por = preco
+                    break
+            if preco_por:
+                break
 
-        textos = [t.strip() for t in card.css("::text").getall() if t and t.strip()]
-        bloco = " ".join(textos)
-        return self.extrair_preco_regex(bloco)
+        for s in seletores_preco_de:
+            textos = card.css(s).getall()
+            textos = [" ".join(t.split()) for t in textos if t and t.strip()]
+            for t in textos:
+                preco = self.extrair_preco_regex(t)
+                if preco:
+                    preco_de = preco
+                    break
+            if preco_de:
+                break
+
+        if not preco_por:
+            textos = [t.strip() for t in card.css("::text").getall() if t and t.strip()]
+            bloco = " ".join(textos)
+            precos = self.extrair_todos_precos_regex(bloco)
+            if precos:
+                preco_por = precos[0]
+                if len(precos) > 1:
+                    preco_de = preco_de or precos[1]
+
+        return self.normalizar_precos(preco=preco_por, preco_por=preco_por, preco_de=preco_de)
 
     def extrair_marca(self, nome):
         if not nome:
@@ -317,7 +446,7 @@ class SupermercadosDiaMKSpider(Spider):
             caminho_resolvido = self._resolver_caminho_arquivo(self.arquivo_entrada)
             self.logger.info("Lendo arquivo de entrada: %s", caminho_resolvido)
 
-            eans = self._ler_eans_arquivo(self.arquivo_entrada)[:50]
+            eans = self._ler_eans_arquivo(self.arquivo_entrada)
             self.logger.info("Processando %d EANs do arquivo (Competidor = DIA)", len(eans))
 
             for ean in eans:
@@ -409,11 +538,16 @@ class SupermercadosDiaMKSpider(Spider):
                 continue
 
             nome = self.extrair_nome_listagem(card)
-            preco = self.extrair_preco_card(card)
+            precos = self.extrair_precos_card(card)
 
-            if nome or preco:
+            if nome or precos.get("preco"):
                 encontrou_algo = True
-                status = "resultado_em_listagem_com_preco" if preco else "resultado_em_listagem_sem_preco"
+                status = (
+                    "resultado_em_listagem_com_preco"
+                    if precos.get("preco")
+                    else "resultado_em_listagem_sem_preco"
+                )
+
                 yield {
                     "loja": "dia_ar",
                     "tipo_busca": tipo_busca,
@@ -421,7 +555,10 @@ class SupermercadosDiaMKSpider(Spider):
                     "ean": busca_valor if tipo_busca == "ean" else None,
                     "nome": nome,
                     "marca": self.extrair_marca(nome),
-                    "preco": preco,
+                    "preco": precos.get("preco"),
+                    "precoPor": precos.get("precoPor"),
+                    "precoDe": precos.get("precoDe"),
+                    "oferta": precos.get("oferta"),
                     "link": response.url,
                     "status_busca": status,
                 }
@@ -435,6 +572,9 @@ class SupermercadosDiaMKSpider(Spider):
                 "nome": None,
                 "marca": None,
                 "preco": None,
+                "precoPor": None,
+                "precoDe": None,
+                "oferta": None,
                 "link": response.url,
                 "status_busca": "nao_indexado_na_busca",
             }
@@ -459,8 +599,8 @@ class SupermercadosDiaMKSpider(Spider):
             if nome:
                 nome = " ".join(nome.split())
 
-        preco = self.extrair_preco_pdp(sel)
-        status = "encontrado_com_preco" if preco else "encontrado_sem_preco"
+        precos = self.extrair_precos_pdp(sel)
+        status = "encontrado_com_preco" if precos.get("preco") else "encontrado_sem_preco"
 
         yield {
             "loja": "dia_ar",
@@ -469,7 +609,10 @@ class SupermercadosDiaMKSpider(Spider):
             "ean": busca_valor if tipo_busca == "ean" else None,
             "nome": nome,
             "marca": self.extrair_marca(nome),
-            "preco": preco,
+            "preco": precos.get("preco"),
+            "precoPor": precos.get("precoPor"),
+            "precoDe": precos.get("precoDe"),
+            "oferta": precos.get("oferta"),
             "link": link or response.url,
             "status_busca": status,
         }
