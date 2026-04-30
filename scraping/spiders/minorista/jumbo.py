@@ -331,6 +331,45 @@ class ProdutoPorEanSpider(Spider):
         )
         return valor_formatado
 
+    def _formatar_desconto_percentual(self, valor):
+        if valor is None:
+            return None
+        try:
+            valor = int(valor)
+        except Exception:
+            return None
+        if valor <= 0:
+            return None
+        return f"-{valor}%"
+
+    def _percentual_str_para_int(self, desconto_str):
+        if not desconto_str:
+            return None
+        m = re.search(r"(-?\d{1,3})\s*%", str(desconto_str))
+        if not m:
+            return None
+        try:
+            valor = abs(int(m.group(1)))
+        except Exception:
+            return None
+        if valor <= 0 or valor >= 100:
+            return None
+        return valor
+
+    def _calcular_preco_por_desconto(self, preco_de_str, desconto_percentual_str):
+        preco_de = self.preco_str_para_float(preco_de_str)
+        desconto = self._percentual_str_para_int(desconto_percentual_str)
+
+        if preco_de is None or desconto is None:
+            return None
+
+        preco_por = preco_de * (1 - desconto / 100.0)
+
+        if preco_por <= 0:
+            return None
+
+        return self.float_para_preco_str(preco_por)
+
     def limpar_nome_candidato(self, texto):
         if not texto:
             return ""
@@ -450,6 +489,7 @@ class ProdutoPorEanSpider(Spider):
             "hellmanns",
             "red bull",
             "colgate",
+            "always",
         ]
         for marca in marcas_conhecidas:
             if marca in nome_norm:
@@ -514,21 +554,56 @@ class ProdutoPorEanSpider(Spider):
                 return True
         return False
 
+    def _limpar_texto_para_preco(self, texto):
+        if not texto:
+            return ""
+
+        texto = str(texto).replace("\xa0", " ")
+        linhas = []
+        for linha in re.split(r"[\r\n]+", texto):
+            linha = " ".join(linha.split()).strip()
+            if not linha:
+                continue
+
+            linha_norm = self.normalizar_texto(linha)
+
+            if "precio sin impuestos nacionales" in linha_norm:
+                continue
+            if re.search(r"\bx\s*un\b", linha_norm):
+                continue
+            if re.search(r"\bx\s*kg\b", linha_norm):
+                continue
+            if re.search(r"\bx\s*lt\b", linha_norm):
+                continue
+            if re.search(r"\bpor unidad\b", linha_norm):
+                continue
+            if re.search(r"\bpor unidade\b", linha_norm):
+                continue
+
+            linhas.append(linha)
+
+        return "\n".join(linhas)
+
     def _extrair_valores_monetarios_do_node(self, node):
         node = self._normalizar_node(node)
         if node is None:
             return []
 
-        if self._node_tem_texto_ignorado(node):
-            return []
-
         texto = " ".join(
             t.strip() for t in node.css("::text").getall() if t and t.strip()
         )
+        if not texto:
+            return []
+
+        texto = self._limpar_texto_para_preco(texto)
+        if not texto:
+            return []
+
         candidatos = []
         padroes = [
             r"\$\s*\d{1,3}(?:\.\d{3})*(?:,\d{2})",
             r"\$\s*\d+(?:,\d{2})",
+            r"\$\s*\d{1,3}(?:\.\d{3})",
             r"\d{1,3}(?:\.\d{3})*(?:,\d{2})",
             r"\d{1,3}(?:\.\d{3})",
         ]
@@ -578,37 +653,13 @@ class ProdutoPorEanSpider(Spider):
         if node is None:
             return None
 
-        if self._node_tem_texto_ignorado(node):
-            return None
-
-        seletores = [
-            "[class*='discount']::text",
-            "[class*='Discount']::text",
-            "[class*='descuento']::text",
-            "[class*='badge']::text",
-            "[class*='flag']::text",
-            "[class*='promotion']::text",
-            "[class*='promo']::text",
-            "span::text",
-            "div::text",
-        ]
-
-        candidatos = []
-        for sel in seletores:
-            for txt in node.css(sel).getall():
-                txt = (txt or "").strip()
-                if not txt:
-                    continue
-                pct = self._extrair_percentual_do_texto(txt)
-                if pct is not None:
-                    candidatos.append(pct)
-
-        if candidatos:
-            return max(candidatos)
-
         texto_total = " ".join(
             t.strip() for t in node.css("::text").getall() if t and t.strip()
         )
+        if not texto_total:
+            return None
+
+        texto_total = self._limpar_texto_para_preco(texto_total)
         return self._extrair_percentual_do_texto(texto_total)
 
     def _tem_percentual_no_node(self, node):
@@ -617,9 +668,6 @@ class ProdutoPorEanSpider(Spider):
     def _extrair_preco_riscado_do_node(self, node):
         node = self._normalizar_node(node)
         if node is None:
-            return None
-
-        if self._node_tem_texto_ignorado(node):
             return None
 
         seletores = [
@@ -644,14 +692,28 @@ class ProdutoPorEanSpider(Spider):
                 if vf is not None:
                     candidatos.append(vf)
 
-        return max(candidatos) if candidatos else None
+        if candidatos:
+            return max(candidatos)
+
+        texto = " ".join(
+            t.strip() for t in node.css("::text").getall() if t and t.strip()
+        )
+        texto = self._limpar_texto_para_preco(texto)
+        texto_norm = self.normalizar_texto(texto)
+
+        m = re.search(
+            r"\$\s*([\d\.,]+)\s*precio regular",
+            texto_norm,
+            re.I | re.S,
+        )
+        if m:
+            return self.preco_str_para_float(m.group(1))
+
+        return None
 
     def _extrair_preco_principal_do_node(self, node):
         node = self._normalizar_node(node)
         if node is None:
-            return None
-
-        if self._node_tem_texto_ignorado(node):
             return None
 
         seletores = [
@@ -675,6 +737,27 @@ class ProdutoPorEanSpider(Spider):
         if candidatos:
             return min(candidatos)
 
+        texto = " ".join(
+            t.strip() for t in node.css("::text").getall() if t and t.strip()
+        )
+        texto = self._limpar_texto_para_preco(texto)
+        texto_norm = self.normalizar_texto(texto)
+
+        m = re.search(
+            r"\$\s*([\d\.,]+)\s*-\s*(\d{1,3})%\s*\$\s*([\d\.,]+)\s*precio regular",
+            texto_norm,
+            re.I | re.S,
+        )
+        if m:
+            preco_atual = self.preco_str_para_float(m.group(1))
+            preco_regular = self.preco_str_para_float(m.group(3))
+            if (
+                preco_atual is not None
+                and preco_regular is not None
+                and preco_regular > preco_atual
+            ):
+                return preco_atual
+
         valores = self._extrair_valores_monetarios_do_node(node)
         if valores:
             return min(valores)
@@ -682,31 +765,80 @@ class ProdutoPorEanSpider(Spider):
         return None
 
     def _extrair_desconto_percentual_html(self, response_sel):
-        seletores = [
-            "[class*='discount']::text",
-            "[class*='Discount']::text",
-            "[class*='descuento']::text",
-            "[class*='badge']::text",
-            "[class*='flag']::text",
-            "[class*='promotion']::text",
-            "[class*='promo']::text",
-            "span::text",
-        ]
-
-        candidatos = []
-        for sel in seletores:
-            for txt in response_sel.css(sel).getall():
-                pct = self._extrair_percentual_do_texto(txt)
-                if pct is not None:
-                    candidatos.append(pct)
-
-        if candidatos:
-            return max(candidatos)
-
-        texto_total = " ".join(
+        texto_total = "\n".join(
             t.strip() for t in response_sel.css("body *::text").getall() if t and t.strip()
         )
+        texto_total = self._limpar_texto_para_preco(texto_total)
         return self._extrair_percentual_do_texto(texto_total)
+
+    def _extrair_tripla_promocional_do_texto(self, texto):
+        if not texto:
+            return None
+
+        texto_limpo = self._limpar_texto_para_preco(texto)
+        if not texto_limpo:
+            return None
+
+        texto_norm = self.normalizar_texto(texto_limpo)
+
+        padroes = [
+            r"\$\s*([\d\.,]+)\s*-\s*(\d{1,3})%\s*\$\s*([\d\.,]+)\s*precio regular",
+            r"\$\s*([\d\.,]+)\s*-\s*(\d{1,3})%\s*.*?\$\s*([\d\.,]+)\s*precio regular",
+        ]
+
+        for padrao in padroes:
+            m = re.search(padrao, texto_norm, re.I | re.S)
+            if not m:
+                continue
+
+            preco_atual = self.preco_str_para_float(m.group(1))
+            preco_regular = self.preco_str_para_float(m.group(3))
+
+            try:
+                desconto_pct = int(float(m.group(2)))
+            except Exception:
+                desconto_pct = None
+
+            if (
+                preco_atual is not None
+                and preco_regular is not None
+                and desconto_pct is not None
+                and 0 < desconto_pct < 90
+                and preco_regular > preco_atual
+            ):
+                return {
+                    "preco_atual": preco_atual,
+                    "preco_regular": preco_regular,
+                    "desconto_pct": desconto_pct,
+                }
+
+        return None
+
+    def _is_promocao_valida(self, preco_atual, preco_regular, desconto_pct):
+        if preco_atual is None or preco_regular is None or desconto_pct is None:
+            return False
+
+        try:
+            preco_atual = float(preco_atual)
+            preco_regular = float(preco_regular)
+            desconto_pct = int(desconto_pct)
+        except Exception:
+            return False
+
+        if preco_atual <= 0 or preco_regular <= 0:
+            return False
+
+        if preco_regular <= preco_atual:
+            return False
+
+        if not (0 < desconto_pct < 90):
+            return False
+
+        preco_calculado = preco_regular * (1 - desconto_pct / 100.0)
+        diferenca = abs(preco_calculado - preco_atual)
+
+        tolerancia = max(3.0, preco_regular * 0.03)
+        return diferenca <= tolerancia
 
     def _coletar_precos_html(self, response_sel):
         resultados = {
@@ -715,6 +847,46 @@ class ProdutoPorEanSpider(Spider):
             "oferta": None,
             "desconto_percentual": None,
         }
+
+        blocos_candidatos = []
+        seletores_blocos = [
+            "[class*='vtex-product-price']",
+            "[class*='productPrice']",
+            "[class*='price']",
+            "[class*='Price']",
+            "main",
+            "body",
+        ]
+
+        vistos = set()
+        for sel in seletores_blocos:
+            for node in response_sel.css(sel):
+                node = self._normalizar_node(node)
+                if node is None:
+                    continue
+                chave = node.get()
+                if not chave or chave in vistos:
+                    continue
+                vistos.add(chave)
+                blocos_candidatos.append(node)
+
+        for node in blocos_candidatos:
+            texto_bloco = "\n".join(
+                t.strip() for t in node.css("::text").getall() if t and t.strip()
+            )
+            tripla = self._extrair_tripla_promocional_do_texto(texto_bloco)
+            if tripla and self._is_promocao_valida(
+                tripla["preco_atual"],
+                tripla["preco_regular"],
+                tripla["desconto_pct"],
+            ):
+                resultados["precoDe"] = self.float_para_preco_str(tripla["preco_regular"])
+                resultados["precoPor"] = self.float_para_preco_str(tripla["preco_atual"])
+                resultados["desconto_percentual"] = self._formatar_desconto_percentual(
+                    tripla["desconto_pct"]
+                )
+                resultados["oferta"] = "x"
+                return resultados
 
         candidatos_principais = []
         seletores_principal = [
@@ -743,31 +915,27 @@ class ProdutoPorEanSpider(Spider):
                 break
 
         melhor_match = None
+        melhor_desconto = None
 
         if bloco_principal is not None:
             desconto_bloco = self._extrair_desconto_percentual_do_node(bloco_principal)
-            if desconto_bloco is not None:
-                resultados["desconto_percentual"] = desconto_bloco
-                resultados["oferta"] = f"-{desconto_bloco}%"
 
             valores = sorted(self._extrair_valores_monetarios_do_node(bloco_principal))
             valores_validos = [v for v in valores if 0 < v < 100000]
 
-            if len(valores_validos) >= 2:
+            if len(valores_validos) >= 2 and desconto_bloco is not None:
                 preco_desc = min(valores_validos)
                 preco_sem_desc = max(valores_validos)
-                if preco_sem_desc > preco_desc:
+                if self._is_promocao_valida(preco_desc, preco_sem_desc, desconto_bloco):
                     melhor_match = (preco_desc, preco_sem_desc)
+                    melhor_desconto = desconto_bloco
 
             if melhor_match is None:
                 preco_riscado = self._extrair_preco_riscado_do_node(bloco_principal)
                 preco_principal = self._extrair_preco_principal_do_node(bloco_principal)
-                if (
-                    preco_riscado is not None
-                    and preco_principal is not None
-                    and preco_riscado > preco_principal
-                ):
+                if self._is_promocao_valida(preco_principal, preco_riscado, desconto_bloco):
                     melhor_match = (preco_principal, preco_riscado)
+                    melhor_desconto = desconto_bloco
 
         if melhor_match is None:
             blocos = response_sel.css(
@@ -781,46 +949,47 @@ class ProdutoPorEanSpider(Spider):
                 if node is None:
                     continue
 
+                texto_bloco = "\n".join(
+                    t.strip() for t in node.css("::text").getall() if t and t.strip()
+                )
+                tripla = self._extrair_tripla_promocional_do_texto(texto_bloco)
+                if tripla and self._is_promocao_valida(
+                    tripla["preco_atual"],
+                    tripla["preco_regular"],
+                    tripla["desconto_pct"],
+                ):
+                    melhor_match = (tripla["preco_atual"], tripla["preco_regular"])
+                    melhor_desconto = tripla["desconto_pct"]
+                    break
+
                 desconto_node = self._extrair_desconto_percentual_do_node(node)
                 valores = sorted(self._extrair_valores_monetarios_do_node(node))
                 valores_validos = [v for v in valores if 0 < v < 100000]
                 preco_riscado = self._extrair_preco_riscado_do_node(node)
                 preco_principal = self._extrair_preco_principal_do_node(node)
 
-                if desconto_node is not None and resultados["desconto_percentual"] is None:
-                    resultados["desconto_percentual"] = desconto_node
-                    resultados["oferta"] = f"-{desconto_node}%"
-
                 if len(valores_validos) >= 2 and desconto_node is not None:
                     preco_desc = min(valores_validos)
                     preco_sem_desc = max(valores_validos)
-                    if preco_sem_desc > preco_desc:
+                    if self._is_promocao_valida(preco_desc, preco_sem_desc, desconto_node):
                         melhor_match = (preco_desc, preco_sem_desc)
+                        melhor_desconto = desconto_node
                         break
 
-                if (
-                    desconto_node is not None
-                    and preco_riscado is not None
-                    and preco_principal is not None
-                    and preco_riscado > preco_principal
-                ):
+                if self._is_promocao_valida(preco_principal, preco_riscado, desconto_node):
                     melhor_match = (preco_principal, preco_riscado)
+                    melhor_desconto = desconto_node
                     break
 
         if melhor_match:
             price_float, list_price_float = melhor_match
             resultados["precoDe"] = self.float_para_preco_str(list_price_float)
             resultados["precoPor"] = self.float_para_preco_str(price_float)
-            if not resultados["oferta"] and list_price_float > price_float:
-                resultados["oferta"] = "x"
+            if melhor_desconto is not None:
+                resultados["desconto_percentual"] = self._formatar_desconto_percentual(melhor_desconto)
+            resultados["oferta"] = "x"
         elif preco_principal_global is not None:
             resultados["precoDe"] = self.float_para_preco_str(preco_principal_global)
-
-        if resultados["desconto_percentual"] is None:
-            desconto_pct = self._extrair_desconto_percentual_html(response_sel)
-            if desconto_pct is not None:
-                resultados["desconto_percentual"] = desconto_pct
-                resultados["oferta"] = f"-{desconto_pct}%"
 
         return resultados
 
@@ -840,35 +1009,45 @@ class ProdutoPorEanSpider(Spider):
             "desconto_percentual": None,
         }
 
+        texto_bloco = "\n".join(
+            t.strip() for t in produto.css("::text").getall() if t and t.strip()
+        )
+
+        tripla = self._extrair_tripla_promocional_do_texto(texto_bloco)
+        if tripla and self._is_promocao_valida(
+            tripla["preco_atual"],
+            tripla["preco_regular"],
+            tripla["desconto_pct"],
+        ):
+            resultados["precoDe"] = self.float_para_preco_str(tripla["preco_regular"])
+            resultados["precoPor"] = self.float_para_preco_str(tripla["preco_atual"])
+            resultados["desconto_percentual"] = self._formatar_desconto_percentual(
+                tripla["desconto_pct"]
+            )
+            resultados["oferta"] = "x"
+            return resultados
+
         preco_principal = self._extrair_preco_principal_do_node(produto)
         preco_riscado = self._extrair_preco_riscado_do_node(produto)
         valores = sorted(self._extrair_valores_monetarios_do_node(produto))
         desconto_pct = self._extrair_desconto_percentual_do_node(produto)
 
-        if desconto_pct is not None:
-            resultados["desconto_percentual"] = desconto_pct
-            resultados["oferta"] = f"-{desconto_pct}%"
-
-        if (
-            preco_riscado is not None
-            and preco_principal is not None
-            and preco_riscado > preco_principal
-        ):
+        if self._is_promocao_valida(preco_principal, preco_riscado, desconto_pct):
             resultados["precoDe"] = self.float_para_preco_str(preco_riscado)
             resultados["precoPor"] = self.float_para_preco_str(preco_principal)
-            if not resultados["oferta"]:
-                resultados["oferta"] = "x"
+            resultados["desconto_percentual"] = self._formatar_desconto_percentual(desconto_pct)
+            resultados["oferta"] = "x"
             return resultados
 
         valores_validos = [v for v in valores if 0 < v < 100000]
-        if len(valores_validos) >= 2:
+        if len(valores_validos) >= 2 and desconto_pct is not None:
             menor = min(valores_validos)
             maior = max(valores_validos)
-            if maior > menor:
+            if self._is_promocao_valida(menor, maior, desconto_pct):
                 resultados["precoDe"] = self.float_para_preco_str(maior)
                 resultados["precoPor"] = self.float_para_preco_str(menor)
-                if not resultados["oferta"]:
-                    resultados["oferta"] = "x"
+                resultados["desconto_percentual"] = self._formatar_desconto_percentual(desconto_pct)
+                resultados["oferta"] = "x"
                 return resultados
 
         if preco_principal is not None:
@@ -945,7 +1124,8 @@ class ProdutoPorEanSpider(Spider):
 
     def _extrair_item_por_ean(self, response_sel, ean_buscado):
         ean_buscado = self._normalizar_ean(ean_buscado)
-        self.logger.info("_extrair_item_por_ean ean_buscado=%r", ean_buscado)
+        self.logger.info("_extrair_item_por_ean ean_buscado='%s'", ean_buscado)
+
         if not ean_buscado:
             return None
 
@@ -954,7 +1134,8 @@ class ProdutoPorEanSpider(Spider):
 
         skus = []
         for blob in blobs:
-            skus.extend(self._coletar_skus_dos_jsons(blob, []))
+            skus.extend(self._coletar_skus_dos_jsons(blob))
+
         self.logger.info("skus brutos encontrados=%d", len(skus))
 
         vistos = set()
@@ -964,6 +1145,7 @@ class ProdutoPorEanSpider(Spider):
             if chave and chave not in vistos:
                 vistos.add(chave)
                 skus_unicos.append(sku)
+
         self.logger.info("skus únicos encontrados=%d", len(skus_unicos))
 
         for sku in skus_unicos:
@@ -971,7 +1153,7 @@ class ProdutoPorEanSpider(Spider):
             refs = sku.get("referenceId") or []
 
             if ean_sku == ean_buscado:
-                self.logger.info("match por ean direto | itemId=%r", sku.get("itemId"))
+                self.logger.info("match por ean direto | itemId='%s'", sku.get("itemId"))
                 return sku
 
             if isinstance(refs, list):
@@ -980,13 +1162,14 @@ class ProdutoPorEanSpider(Spider):
                         valor = self._normalizar_ean(ref.get("Value") or ref.get("value"))
                         if valor == ean_buscado:
                             self.logger.info(
-                                "match por referenceId | itemId=%r", sku.get("itemId")
+                                "match por referenceId | itemId='%s'",
+                                sku.get("itemId"),
                             )
                             return sku
 
         if skus_unicos:
             self.logger.info(
-                "nenhum SKU bateu por EAN, usando fallback primeiro sku | itemId=%r",
+                "nenhum SKU bateu por EAN, usando fallback primeiro sku | itemId='%s'",
                 skus_unicos[0].get("itemId"),
             )
             return skus_unicos[0]
@@ -1016,35 +1199,35 @@ class ProdutoPorEanSpider(Spider):
                         ean_ok = True
                         break
 
-        sku_item_id = self._normalizar_sku(sku_item.get("itemId"))
-        if sku_esperado and sku_item_id and sku_item_id == sku_esperado:
+        sku_itemid = self._normalizar_sku(sku_item.get("itemId"))
+        if sku_esperado and sku_itemid and sku_itemid == sku_esperado:
             sku_ok = True
 
         nome_item = sku_item.get("name") or ""
         if nome_esperado and nome_item:
             if self.nome_parece_produto(nome_esperado) and self.nome_parece_produto(nome_item):
-                if self.normalizar_texto(nome_esperado) in self.normalizar_texto(
-                    nome_item
-                ) or self.normalizar_texto(nome_item) in self.normalizar_texto(
-                    nome_esperado
+                if (
+                    self.normalizar_texto(nome_esperado) in self.normalizar_texto(nome_item)
+                    or self.normalizar_texto(nome_item) in self.normalizar_texto(nome_esperado)
                 ):
                     nome_ok = True
-        elif nome_pagina and nome_item:
-            if self.normalizar_texto(nome_pagina) in self.normalizar_texto(
-                nome_item
-            ) or self.normalizar_texto(nome_item) in self.normalizar_texto(nome_pagina):
-                nome_ok = True
+            elif nome_pagina and nome_item:
+                if (
+                    self.normalizar_texto(nome_pagina) in self.normalizar_texto(nome_item)
+                    or self.normalizar_texto(nome_item) in self.normalizar_texto(nome_pagina)
+                ):
+                    nome_ok = True
         elif nome_pagina and nome_esperado:
-            if self.normalizar_texto(nome_pagina) in self.normalizar_texto(
-                nome_esperado
-            ) or self.normalizar_texto(nome_esperado) in self.normalizar_texto(
-                nome_pagina
+            if (
+                self.normalizar_texto(nome_pagina) in self.normalizar_texto(nome_esperado)
+                or self.normalizar_texto(nome_esperado) in self.normalizar_texto(nome_pagina)
             ):
                 nome_ok = True
 
         self.logger.info(
             "_validar_tripla_produto ean_ok=%s sku_ok=%s nome_ok=%s | "
-            "ean=%r sku=%r nome=%r nome_pagina=%r itemId=%r itemEan=%r itemName=%r",
+            "ean='%s' sku='%s' nome='%s' nome_pagina='%s' "
+            "itemId='%s' itemEan='%s' itemName='%s'",
             ean_ok,
             sku_ok,
             nome_ok,
@@ -1057,31 +1240,9 @@ class ProdutoPorEanSpider(Spider):
             sku_item.get("name"),
         )
 
-        if ean_ok and (sku_ok or nome_ok):
+        if (ean_ok and sku_ok) or nome_ok:
             return True
         return False
-
-    def _preencher_precos_via_json(self, item, sku_item):
-        sellers = sku_item.get("sellers") or []
-        for seller in sellers:
-            comm = seller.get("commertialOffer") or {}
-            price = comm.get("Price")
-            list_price = comm.get("ListPrice")
-
-            candidatos_float = []
-            for v in (price, list_price):
-                vf = self.preco_str_para_float(v)
-                if vf is not None:
-                    candidatos_float.append(vf)
-
-            if candidatos_float and not item.get("precoDe"):
-                maior = max(candidatos_float)
-                item["precoDe"] = self.float_para_preco_str(maior)
-                return item
-
-        return item
-
-    # ---------------- API VTEX por SKU ----------------
 
     def _request_catalog_por_sku(self, sku, ean_atual, item_base):
         url = self.site_cfg["catalog_sku"].format(sku=quote(str(sku)))
@@ -1126,6 +1287,7 @@ class ProdutoPorEanSpider(Spider):
             nome_prod = prod.get("productName") or prod.get("productNameWithBrand")
             if nome_prod and not nome_pagina:
                 nome_pagina = nome_prod
+
             items = prod.get("items") or []
             for it in items:
                 if str(it.get("itemId") or "").strip() == sku_encontrado:
@@ -1135,7 +1297,7 @@ class ProdutoPorEanSpider(Spider):
                 break
 
         if not sku_item:
-            self.logger.info("SKU %s não localizado dentro do catalog response", sku_encontrado)
+            self.logger.info("SKU '%s' não localizado dentro do catalog response", sku_encontrado)
             return
 
         item["sku"] = sku_encontrado or item.get("sku")
@@ -1155,10 +1317,9 @@ class ProdutoPorEanSpider(Spider):
             sku_item=sku_item,
             nome_pagina=nome_pagina,
         )
-
         if not tripla_ok:
             self.logger.info(
-                "Tripla API catalog não confere | ean=%r | sku=%r | nome=%r | url=%s",
+                "Tripla API catalog não confere | ean=%s sku=%s nome=%s url=%s",
                 ean_atual,
                 sku_encontrado,
                 item.get("nome"),
@@ -1171,9 +1332,35 @@ class ProdutoPorEanSpider(Spider):
             for seller in sellers:
                 offer = seller.get("commertialOffer") or {}
                 price_float = self.preco_str_para_float(offer.get("Price"))
+                listprice_float = self.preco_str_para_float(offer.get("ListPrice"))
+
+                if (
+                    price_float is not None
+                    and listprice_float is not None
+                    and price_float > 0
+                    and listprice_float > 0
+                    and price_float != listprice_float
+                ):
+                    self.logger.info(
+                        "API catalog retornou Price/ListPrice | ean=%s sku=%s valor=%0.2f url=%s",
+                        ean_atual,
+                        sku_encontrado,
+                        price_float,
+                        response.url,
+                    )
+
                 if price_float is not None and price_float > 0:
                     item["precoDe"] = self.float_para_preco_str(price_float)
                     break
+
+        if not item.get("precoPor") and item.get("precoDe") and item.get("desconto_percentual"):
+            item["precoPor"] = self._calcular_preco_por_desconto(
+                item.get("precoDe"),
+                item.get("desconto_percentual"),
+            )
+
+        if not item.get("oferta") and item.get("precoPor"):
+            item["oferta"] = "x"
 
         if not item.get("precoDe"):
             self.logger.info("Saindo sem precoDe após catalog sku=%s", sku_encontrado)
@@ -1181,30 +1368,27 @@ class ProdutoPorEanSpider(Spider):
 
         item["link"] = item.get("link") or response.url
 
-        chave_item = (
-            str(item.get("ean")),
-            str(item.get("sku")),
-            str(item.get("link")),
-        )
+        chave_item = (str(item.get("ean")), str(item.get("sku")), str(item.get("link")))
         if chave_item in self.itens_emitidos:
             self.logger.info("Item duplicado ignorado %r", chave_item)
             return
-        self.itens_emitidos.add(chave_item)
 
+        self.itens_emitidos.add(chave_item)
         item.setdefault("print_tela_path", None)
 
         self.logger.info(
-            "Emitindo item final ean=%s sku=%s nome=%r",
+            "Emitindo item final | ean=%s sku=%s nome=%s",
             item.get("ean"),
             item.get("sku"),
             item.get("nome"),
         )
         yield item
 
-    # ---------------- Lista de produtos (busca) ----------------
+    # ---------------- Lista de produtos busca ----------------
 
     def obter_produtos_da_pagina(self, response):
         response_sel = self._get_html_selector(response)
+
         seletores_por_loja = {
             "jumbo_ar": [
                 "article",
@@ -1212,7 +1396,7 @@ class ProdutoPorEanSpider(Spider):
                 "[class*='Product']",
                 "[class*='vtex-product-summary']",
                 "a[href*='/p']",
-                "a[href*='?_q=']",
+                "a[href*='?_q']",
             ],
         }
 
@@ -1224,7 +1408,7 @@ class ProdutoPorEanSpider(Spider):
             for node in response_sel.css(seletor):
                 href = node.css("a::attr(href), ::attr(href)").get()
                 textos = node.css("::text").getall()
-                texto_base = "".join(textos[:3]).strip() if textos else ""
+                texto_base = " ".join(textos[:3]).strip() if textos else ""
                 chave = f"{href or ''}|{texto_base}"
                 if chave not in chaves_vistas:
                     chaves_vistas.add(chave)
@@ -1265,13 +1449,11 @@ class ProdutoPorEanSpider(Spider):
         response_sel = self._get_html_selector(response)
         seletores_link = [
             "a[href*='/producto/']::attr(href)",
-            "a[href*='/p/']::attr(href)",
             "a[href*='/p']::attr(href)",
-            "a[href*='?_q=']::attr(href)",
+            "a[href*='?_q']::attr(href)",
             "a::attr(href)",
             "::attr(href)",
         ]
-
         for seletor in seletores_link:
             link = produto.css(seletor).get()
             if link:
@@ -1290,7 +1472,6 @@ class ProdutoPorEanSpider(Spider):
             ".pagination a.next::attr(href)",
             "li.next a::attr(href)",
         ]
-
         for seletor in seletores:
             next_page = response_sel.css(seletor).get()
             if next_page:
@@ -1302,6 +1483,7 @@ class ProdutoPorEanSpider(Spider):
         self.logger.info("parse_search url=%s ean=%s", response.url, ean_atual)
 
         produtos = self.obter_produtos_da_pagina(response)
+
         for produto in produtos:
             nome_limpo = self.extrair_nome_produto_lista(produto)
             if not nome_limpo:
@@ -1310,6 +1492,7 @@ class ProdutoPorEanSpider(Spider):
             link_absoluto = self.extrair_link_produto_lista(produto, response)
             if not link_absoluto:
                 continue
+
             if not self.eh_url_de_produto(link_absoluto):
                 continue
 
@@ -1329,10 +1512,7 @@ class ProdutoPorEanSpider(Spider):
                 "link": link_absoluto,
             }
 
-            self.logger.info(
-                "Agendando produto da busca nome=%r | %s", nome_limpo, link_absoluto
-            )
-
+            self.logger.info("Agendando produto da busca nome=%s | %s", nome_limpo, link_absoluto)
             yield Request(
                 url=link_absoluto,
                 callback=self.parse_produto,
@@ -1352,7 +1532,6 @@ class ProdutoPorEanSpider(Spider):
         ean_atual = str(response.meta.get("ean_atual") or self.ean or "").strip()
         item = (response.meta.get("item_base") or {}).copy()
         via_url_direta = response.meta.get("via_url_direta", False)
-
         response_sel = self._get_html_selector(response)
 
         if not item.get("nome"):
@@ -1387,12 +1566,30 @@ class ProdutoPorEanSpider(Spider):
         if via_url_direta:
             if not item.get("precoDe") and precos_html.get("precoDe"):
                 item["precoDe"] = precos_html.get("precoDe")
+            if not item.get("desconto_percentual") and precos_html.get("desconto_percentual") is not None:
+                item["desconto_percentual"] = precos_html.get("desconto_percentual")
             if not item.get("precoPor") and precos_html.get("precoPor"):
                 item["precoPor"] = precos_html.get("precoPor")
             if not item.get("oferta") and precos_html.get("oferta"):
                 item["oferta"] = precos_html.get("oferta")
-            if not item.get("desconto_percentual") and precos_html.get("desconto_percentual") is not None:
+        else:
+            if precos_html.get("precoDe"):
+                item["precoDe"] = precos_html.get("precoDe")
+            if precos_html.get("desconto_percentual") is not None:
                 item["desconto_percentual"] = precos_html.get("desconto_percentual")
+            if precos_html.get("precoPor"):
+                item["precoPor"] = precos_html.get("precoPor")
+            if precos_html.get("oferta"):
+                item["oferta"] = precos_html.get("oferta")
+
+        if not item.get("precoPor") and item.get("precoDe") and item.get("desconto_percentual"):
+            item["precoPor"] = self._calcular_preco_por_desconto(
+                item.get("precoDe"),
+                item.get("desconto_percentual"),
+            )
+
+        if not item.get("oferta") and item.get("precoPor"):
+            item["oferta"] = "x"
 
         yield self._request_catalog_por_sku(
             sku=sku_encontrado,
