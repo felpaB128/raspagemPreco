@@ -1,1598 +1,506 @@
-import base64
 import csv
 import json
+import os
 import re
-import unicodedata
-from pathlib import Path
 from urllib.parse import quote
 
-from scrapy import Spider, Request, Selector
-
-try:
-    import openpyxl
-except ImportError:
-    openpyxl = None
+import scrapy
+import openpyxl
 
 
-SITES = {
-    "jumbo_ar": {
-        "base_url_busca": "https://www.jumbo.com.ar/busqueda?q={query}",
-        "url_direta": "https://www.jumbo.com.ar/{query}?_q={query}&map=ft",
-        "catalog_sku": "https://www.jumbo.com.ar/api/catalog_system/pub/products/search?fq=skuId:{sku}",
-        "allowed_domains": [
-            "www.jumbo.com.ar",
-            "jumbo.com.ar",
-        ],
-    },
-}
-
-
-class ProdutoPorEanSpider(Spider):
-    name = "produto_por_ean"
+class JumboSearchSpider(scrapy.Spider):
+    name = "jumbo_search"
+    allowed_domains = ["jumbo.com.ar"]
 
     custom_settings = {
-        "ZYTE_API_TRANSPARENT_MODE": True,
-        "CONCURRENT_REQUESTS_PER_DOMAIN": 4,
-        "DOWNLOAD_DELAY": 0.2,
+        "DOWNLOAD_DELAY": 0.8,
+        "CONCURRENT_REQUESTS_PER_DOMAIN": 2,
+        "DOWNLOAD_TIMEOUT": 60,
         "LOG_LEVEL": "INFO",
+        "FEED_EXPORT_ENCODING": "utf-8",
         "FEED_EXPORT_FIELDS": [
-            "loja",
             "ean",
             "sku",
             "nome",
             "marca",
             "precoDe",
             "precoPor",
+            "porcentagem",
             "oferta",
-            "desconto_percentual",
-            "print_tela_path",
+            "loja",
             "link",
         ],
     }
 
-    def __init__(self, ean=None, arquivo_entrada=None, loja=None, *args, **kwargs):
+    def __init__(self, ean=None, ean_file=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.loja = (loja or "").strip().lower()
-        if self.loja not in SITES:
-            raise ValueError(f"Loja '{self.loja}' não suportada. Use: {list(SITES.keys())}")
+        self.eans = []
 
-        if not ean and not arquivo_entrada:
-            raise ValueError(
-                "Passe ean ou arquivo_entrada. "
-                "Ex.: -a ean=789... ou -a arquivo_entrada=C:\\arquivo.xlsx"
-            )
+        if ean:
+            self.eans.append(self.clean_ean(ean))
 
-        self.ean = str(ean).strip() if ean else None
-        self.arquivo_entrada = arquivo_entrada
-        self.site_cfg = SITES[self.loja]
-        self.allowed_domains = self.site_cfg["allowed_domains"]
+        if ean_file:
+            caminho = os.path.expanduser(str(ean_file).strip())
+            if not os.path.isfile(caminho):
+                raise ValueError(f"Arquivo não encontrado: {caminho}")
 
-        self.prints_dir = Path("prints")
-        self.prints_dir.mkdir(exist_ok=True)
+            self.eans.extend(self.load_eans_from_file(caminho))
 
-        self.itens_emitidos = set()
+        self.eans = self.unique_preserve_order([x for x in self.eans if x])
 
-    async def start(self):
-        for req in self._build_start_requests():
-            yield req
+        if not self.eans:
+            raise ValueError("Passe -a ean=... ou -a ean_file=... com uma planilha/arquivo válido")
 
-    def _build_start_requests(self):
-        eans = [self.ean] if self.ean else self._ler_eans_arquivo(self.arquivo_entrada)
+        self.logger.info(f"Total de EANs carregados: {len(self.eans)}")
 
-        for ean in eans:
-            ean = self._normalizar_ean(ean)
-            if not ean:
+    def clean_ean(self, value):
+        if value is None:
+            return None
+
+        s = str(value).strip()
+        if not s:
+            return None
+
+        if re.fullmatch(r"\d+(\.0+)?", s):
+            s = s.split(".")[0]
+
+        s = re.sub(r"[^\d]", "", s)
+
+        return s or None
+
+    def normalize_header(self, value):
+        if value is None:
+            return ""
+        s = str(value).strip().upper()
+        s = s.replace("\ufeff", "")
+        s = re.sub(r"\s+", " ", s)
+        return s
+
+    def unique_preserve_order(self, values):
+        seen = set()
+        result = []
+        for v in values:
+            if v in seen:
                 continue
+            seen.add(v)
+            result.append(v)
+        return result
 
-            query_enc = quote(ean)
-            url_direta = self.site_cfg["url_direta"].format(query=query_enc)
-            url_busca = self.site_cfg["base_url_busca"].format(query=query_enc)
+    def load_eans_from_file(self, caminho):
+        ext = os.path.splitext(caminho)[1].lower()
 
-            item_base = {
-                "loja": self.loja,
-                "ean": ean,
-                "sku": None,
-                "nome": None,
-                "marca": None,
-                "precoDe": None,
-                "precoPor": None,
-                "oferta": None,
-                "desconto_percentual": None,
-                "print_tela_path": None,
-                "link": url_direta,
-            }
+        if ext in [".xlsx", ".xlsm", ".xltx", ".xltm"]:
+            return self.load_eans_from_excel(caminho)
 
-            self.logger.info("Agendando URL direta para EAN=%s | %s", ean, url_direta)
-            yield Request(
-                url=url_direta,
-                callback=self.parse_produto,
-                dont_filter=True,
-                meta={
-                    "item_base": item_base,
-                    "ean_atual": ean,
-                    "via_url_direta": True,
-                    "zyte_api_automap": {
-                        "browserHtml": True,
-                        "screenshot": True,
-                    },
-                },
-            )
+        if ext in [".csv", ".txt"]:
+            return self.load_eans_from_text(caminho)
 
-            self.logger.info("Agendando busca para EAN=%s | %s", ean, url_busca)
-            yield Request(
-                url=url_busca,
-                callback=self.parse_search,
-                dont_filter=True,
-                meta={
-                    "ean_atual": ean,
-                    "zyte_api_automap": {
-                        "browserHtml": True,
-                    },
-                },
-            )
+        raise ValueError(f"Extensão não suportada: {ext}. Use XLSX, CSV ou TXT")
+
+    def load_eans_from_excel(self, caminho):
+        wb = openpyxl.load_workbook(caminho, read_only=True, data_only=True)
+        ws = wb.active
+
+        header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+        if not header_row:
+            wb.close()
+            raise ValueError("Planilha vazia")
+
+        ean_col_index = None
+        for idx, cell_value in enumerate(header_row):
+            h = self.normalize_header(cell_value)
+            if h == "EAN":
+                ean_col_index = idx
+                break
+
+        if ean_col_index is None:
+            wb.close()
+            raise ValueError("Não encontrei a coluna 'EAN' no cabeçalho da planilha")
+
+        eans = []
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if ean_col_index >= len(row):
+                continue
+            ean = self.clean_ean(row[ean_col_index])
+            if ean:
+                eans.append(ean)
+
+        wb.close()
+        return eans
+
+    def load_eans_from_text(self, caminho):
+        eans = []
+
+        with open(caminho, "r", encoding="utf-8-sig", newline="") as f:
+            amostra = f.read(2048)
+            f.seek(0)
+
+            delimiter = ";" if amostra.count(";") > amostra.count(",") else ","
+
+            if "EAN" in self.normalize_header(amostra):
+                reader = csv.DictReader(f, delimiter=delimiter)
+                for row in reader:
+                    ean = self.clean_ean(row.get("EAN"))
+                    if ean:
+                        eans.append(ean)
+            else:
+                for line in f:
+                    ean = self.clean_ean(line)
+                    if ean:
+                        eans.append(ean)
+
+        return eans
 
     def start_requests(self):
-        yield from self._build_start_requests()
-
-    # ---------------- Leitura de arquivo ----------------
-
-    def _ler_eans_csv(self, caminho: Path):
-        eans = []
-        with caminho.open("r", encoding="utf-8-sig", newline="") as f:
-            reader = csv.DictReader(f)
-            if not reader.fieldnames:
-                raise ValueError("CSV sem cabeçalho.")
-
-            nomes = {c.lower().strip(): c for c in reader.fieldnames}
-            coluna_ean = (
-                nomes.get("ean")
-                or nomes.get("código ean")
-                or nomes.get("codigo ean")
-                or nomes.get("codigo_ean")
-                or nomes.get("codigoean")
-                or nomes.get("ean 13")
-                or nomes.get("cod ean")
-                or nomes.get("cod_ean")
+        for ean in self.eans:
+            url = (
+                "https://www.jumbo.com.ar/api/catalog_system/pub/products/search/"
+                f"?fq=alternateIds_Ean:{quote(ean)}"
             )
-            if not coluna_ean:
-                raise ValueError(
-                    f"Não encontrei coluna de EAN no CSV. Cabeçalho: {reader.fieldnames}"
-                )
-
-            for row in reader:
-                valor = (row.get(coluna_ean) or "").strip()
-                if valor:
-                    eans.append(valor)
-
-        return list(dict.fromkeys(eans))
-
-    def _ler_eans_xlsx(self, caminho: Path):
-        if openpyxl is None:
-            raise RuntimeError("openpyxl não está instalado. Rode: pip install openpyxl")
-
-        wb = openpyxl.load_workbook(str(caminho), read_only=True, data_only=True)
-        ws = wb[wb.sheetnames[0]]
-        rows = list(ws.iter_rows(values_only=True))
-        wb.close()
-
-        if not rows:
-            raise ValueError("Planilha vazia.")
-
-        header_row_idx = None
-        for i, row in enumerate(rows):
-            if row is None:
-                continue
-            valores = [str(c).strip() for c in row if c is not None and str(c).strip()]
-            if valores:
-                header_row_idx = i
-                break
-
-        if header_row_idx is None:
-            raise ValueError("Planilha sem dados.")
-
-        idx_ean = 0
-        eans = []
-        for row in rows[header_row_idx + 1 :]:
-            if row is None or all(c is None for c in row):
-                continue
-            if idx_ean >= len(row):
-                continue
-            valor = row[idx_ean]
-            if valor is None:
-                continue
-            valor_str = str(valor).strip()
-            if valor_str:
-                eans.append(valor_str)
-
-        return list(dict.fromkeys(eans))
-
-    def _ler_eans_arquivo(self, caminho_str: str):
-        caminho = Path(caminho_str)
-        if not caminho.exists():
-            raise FileNotFoundError(f"Arquivo de entrada não encontrado: {caminho}")
-
-        sufixo = caminho.suffix.lower()
-        if sufixo == ".csv":
-            return self._ler_eans_csv(caminho)
-        if sufixo == ".xlsx":
-            return self._ler_eans_xlsx(caminho)
-        raise ValueError(f"Extensão não suportada: {sufixo}. Use .csv ou .xlsx para arquivo_entrada.")
-
-    # ---------------- Utilidades gerais ----------------
-
-    def slugify(self, texto: str) -> str:
-        texto = (texto or "").strip().lower()
-        texto = re.sub(r"[^\w\s-]", "", texto, flags=re.UNICODE)
-        texto = re.sub(r"[-\s]+", "-", texto)
-        return (texto[:120] or "item").strip("-") or "item"
-
-    def normalizar_texto(self, texto):
-        if not texto:
-            return ""
-        texto = str(texto).strip().lower()
-        texto = unicodedata.normalize("NFKD", texto)
-        texto = "".join(c for c in texto if not unicodedata.combining(c))
-        texto = re.sub(r"\s+", " ", texto)
-        return texto.strip()
-
-    def _normalizar_ean(self, valor):
-        if valor is None:
-            return None
-        s = re.sub(r"\D", "", str(valor))
-        return s or None
-
-    def _normalizar_sku(self, valor):
-        if valor is None:
-            return None
-        s = re.sub(r"\D", "", str(valor))
-        return s or None
-
-    def nome_parece_produto(self, texto, ean_atual=None):
-        if not texto:
-            return False
-        txt = self.limpar_nome_candidato(texto)
-        txt_norm = self.normalizar_texto(txt)
-
-        if len(txt) < 5:
-            return False
-
-        if self.texto_parece_ean(txt):
-            return False
-        if ean_atual and txt == str(ean_atual):
-            return False
-        if re.fullmatch(r"[\d\W]+", txt):
-            return False
-        if self.texto_parece_banner(txt):
-            return False
-        if len(txt.split()) < 2:
-            return False
-
-        palavras_ruins = {
-            "prime",
-            "week",
-            "exclusivo",
-            "exclusiva",
-            "oferta",
-            "ofertas",
-            "promo",
-            "promocion",
-            "promociones",
-        }
-        palavras = re.findall(r"[a-zA-ZÀ-ÿ0-9]+", txt_norm)
-        if palavras and all(p in palavras_ruins for p in palavras):
-            return False
-
-        return True
-
-    def preco_str_para_float(self, preco_str):
-        if preco_str is None:
-            return None
-        if isinstance(preco_str, (int, float)):
-            try:
-                valor = float(preco_str)
-                return valor if valor > 0 else None
-            except Exception:
-                return None
-
-        s = str(preco_str).replace("\xa0", " ").strip()
-        s = re.sub(r"[^\d\.,]", "", s)
-        if not s or not re.search(r"\d", s):
-            return None
-
-        if "," in s:
-            s = s.replace(".", "").replace(",", ".")
-        else:
-            partes = s.split(".")
-            if len(partes) > 2:
-                s = s.replace(".", "")
-            elif len(partes) == 2 and len(partes[1]) == 3:
-                s = s.replace(".", "")
-
-        try:
-            valor = float(s)
-        except Exception:
-            return None
-
-        if valor <= 0 or valor > 100000:
-            return None
-        return valor
-
-    def float_para_preco_str(self, valor_float):
-        if valor_float is None:
-            return None
-        try:
-            valor_float = float(valor_float)
-        except Exception:
-            return None
-        valor_formatado = f"$ {valor_float:,.2f}"
-        valor_formatado = (
-            valor_formatado.replace(",", "X").replace(".", ",").replace("X", ".")
-        )
-        return valor_formatado
-
-    def _formatar_desconto_percentual(self, valor):
-        if valor is None:
-            return None
-        try:
-            valor = int(valor)
-        except Exception:
-            return None
-        if valor <= 0:
-            return None
-        return f"-{valor}%"
-
-    def _percentual_str_para_int(self, desconto_str):
-        if not desconto_str:
-            return None
-        m = re.search(r"(-?\d{1,3})\s*%", str(desconto_str))
-        if not m:
-            return None
-        try:
-            valor = abs(int(m.group(1)))
-        except Exception:
-            return None
-        if valor <= 0 or valor >= 100:
-            return None
-        return valor
-
-    def _calcular_preco_por_desconto(self, preco_de_str, desconto_percentual_str):
-        preco_de = self.preco_str_para_float(preco_de_str)
-        desconto = self._percentual_str_para_int(desconto_percentual_str)
-
-        if preco_de is None or desconto is None:
-            return None
-
-        preco_por = preco_de * (1 - desconto / 100.0)
-
-        if preco_por <= 0:
-            return None
-
-        return self.float_para_preco_str(preco_por)
-
-    def limpar_nome_candidato(self, texto):
-        if not texto:
-            return ""
-        txt = " ".join(str(texto).split()).strip()
-        txt = re.sub(r"\s*\|\s*jumbo.*$", "", txt, flags=re.IGNORECASE)
-        txt = re.sub(r"\s*-\s*jumbo.*$", "", txt, flags=re.IGNORECASE)
-        txt = re.sub(r"\s*\|\s*cencosud.*$", "", txt, flags=re.IGNORECASE)
-        txt = re.sub(r"\s*-\s*cencosud.*$", "", txt, flags=re.IGNORECASE)
-        return txt.strip(" -|:")
-
-    def salvar_screenshot(self, item, response):
-        raw = getattr(response, "raw_api_response", None) or {}
-        screenshot_b64 = raw.get("screenshot")
-        if not screenshot_b64:
-            return None
-        nome_arquivo = f"{self.slugify(item.get('nome') or item.get('ean') or 'item')}.png"
-        caminho_arquivo = self.prints_dir / nome_arquivo
-        with open(caminho_arquivo, "wb") as f:
-            f.write(base64.b64decode(screenshot_b64))
-        return str(caminho_arquivo.resolve())
-
-    def _get_html_selector(self, response):
-        raw = getattr(response, "raw_api_response", None) or {}
-        browser_html = raw.get("browserHtml")
-        if browser_html:
-            return Selector(text=browser_html)
-        return Selector(text=response.text or "")
-
-    def texto_parece_ean(self, texto):
-        if not texto:
-            return False
-        texto_limpo = re.sub(r"\D", "", str(texto))
-        return texto_limpo.isdigit() and 8 <= len(texto_limpo) <= 14
-
-    def texto_parece_banner(self, texto):
-        if not texto:
-            return False
-        t = self.normalizar_texto(texto)
-        bloqueados = [
-            "especial de la semana",
-            "ofertas",
-            "oferta",
-            "promociones",
-            "promocion",
-            "catalogo",
-            "resultados",
-            "busqueda",
-            "supermercado online",
-            "aprovecha",
-            "prime week",
-            "exclusivo",
-            "beneficio",
-            "imperdible",
-            "solo por hoy",
-            "cyber",
-            "hot sale",
-            "black friday",
-        ]
-        if any(b in t for b in bloqueados):
-            return True
-        if re.search(r"\b\d{1,2}\s*cuotas\b", t):
-            return True
-        if re.search(r"\bahorra\b", t):
-            return True
-        return False
-
-    def extrair_nome_produto_pagina(self, response_sel, ean_atual=None):
-        seletores_nome = [
-            "[class*='productName']::text",
-            "[class*='product-name']::text",
-            "[class*='ProductName']::text",
-            "[class*='productNameContainer']::text",
-            "[class*='productNameContainer'] *::text",
-            "[class*='vtex-store-components-3-x-productNameContainer']::text",
-            "[class*='vtex-store-components-3-x-productNameContainer'] *::text",
-            "h1[class*='product']::text",
-            "h1::text",
-            "meta[property='og:title']::attr(content)",
-            "title::text",
-        ]
-
-        candidatos = []
-        for seletor in seletores_nome:
-            textos = response_sel.css(seletor).getall()
-            for txt in textos:
-                txt = self.limpar_nome_candidato(txt)
-                if txt and txt not in candidatos:
-                    candidatos.append(txt)
-        for txt in candidatos:
-            if self.nome_parece_produto(txt, ean_atual=ean_atual):
-                return txt
-        return None
-
-    def extrair_marca(self, nome_limpo: str):
-        if not nome_limpo:
-            return None
-        nome = " ".join(str(nome_limpo).split()).strip()
-        nome_norm = self.normalizar_texto(nome)
-
-        marcas_conhecidas = [
-            "nivea",
-            "coca-cola",
-            "coca cola",
-            "pepsi",
-            "nestle",
-            "la serenisima",
-            "serenisima",
-            "arcor",
-            "bagley",
-            "knorr",
-            "ala",
-            "skip",
-            "drive",
-            "rexona",
-            "sedal",
-            "dove",
-            "hellmanns",
-            "red bull",
-            "colgate",
-            "always",
-        ]
-        for marca in marcas_conhecidas:
-            if marca in nome_norm:
-                return marca.title()
-
-        palavras = nome.split()
-        if palavras:
-            return palavras[0]
-        return None
-
-    def eh_url_de_produto(self, url):
-        if not url:
-            return False
-        url = url.lower()
-        if re.search(r"/p(?:\?|$)", url):
-            return True
-        if re.search(r"https?://[^/]+/\d{8,14}(?:\?|$|/)", url):
-            return True
-        if "/busqueda" in url:
-            return False
-        return True
-
-    # ---------------- Extração de preços HTML ----------------
-
-    def _normalizar_node(self, node):
-        if node is None:
-            return None
-        if isinstance(node, list):
-            return node[0] if node else None
-        try:
-            if node.__class__.__name__ == "SelectorList":
-                return node[0] if len(node) else None
-        except Exception:
-            pass
-        return node
-
-    def _texto_ignorado_preco(self, texto):
-        t = self.normalizar_texto(texto)
-        bloqueados = [
-            "precio regular x lt",
-            "precio regular x kg",
-            "precio regular x un",
-            "precio regular x unidad",
-            "precio sin impuestos nacionales",
-            "sin impostos nacionales",
-            "sin impostos",
-            "sin impuestos",
-            "x lt",
-            "x kg",
-            "x un",
-            "por unidade",
-            "por unidad",
-        ]
-        return any(b in t for b in bloqueados)
-
-    def _node_tem_texto_ignorado(self, node):
-        node = self._normalizar_node(node)
-        if node is None:
-            return False
-        for txt in node.css("::text").getall():
-            if self._texto_ignorado_preco(txt):
-                return True
-        return False
-
-    def _limpar_texto_para_preco(self, texto):
-        if not texto:
-            return ""
-
-        texto = str(texto).replace("\xa0", " ")
-        linhas = []
-        for linha in re.split(r"[\r\n]+", texto):
-            linha = " ".join(linha.split()).strip()
-            if not linha:
-                continue
-
-            linha_norm = self.normalizar_texto(linha)
-
-            if "precio sin impuestos nacionales" in linha_norm:
-                continue
-            if re.search(r"\bx\s*un\b", linha_norm):
-                continue
-            if re.search(r"\bx\s*kg\b", linha_norm):
-                continue
-            if re.search(r"\bx\s*lt\b", linha_norm):
-                continue
-            if re.search(r"\bpor unidad\b", linha_norm):
-                continue
-            if re.search(r"\bpor unidade\b", linha_norm):
-                continue
-
-            linhas.append(linha)
-
-        return "\n".join(linhas)
-
-    def _extrair_valores_monetarios_do_node(self, node):
-        node = self._normalizar_node(node)
-        if node is None:
-            return []
-
-        texto = " ".join(
-            t.strip() for t in node.css("::text").getall() if t and t.strip()
-        )
-        if not texto:
-            return []
-
-        texto = self._limpar_texto_para_preco(texto)
-        if not texto:
-            return []
-
-        candidatos = []
-        padroes = [
-            r"\$\s*\d{1,3}(?:\.\d{3})*(?:,\d{2})",
-            r"\$\s*\d+(?:,\d{2})",
-            r"\$\s*\d{1,3}(?:\.\d{3})",
-            r"\d{1,3}(?:\.\d{3})*(?:,\d{2})",
-            r"\d{1,3}(?:\.\d{3})",
-        ]
-        for padrao in padroes:
-            for m in re.findall(padrao, texto):
-                vf = self.preco_str_para_float(m)
-                if vf is not None:
-                    candidatos.append(vf)
-
-        unicos = []
-        vistos = set()
-        for v in candidatos:
-            chave = round(v, 2)
-            if chave not in vistos:
-                vistos.add(chave)
-                unicos.append(v)
-        return unicos
-
-    def _extrair_percentual_do_texto(self, texto):
-        if not texto:
-            return None
-        t = self.normalizar_texto(texto)
-        padroes = [
-            r"-\s*(\d{1,3})\s*%",
-            r"(\d{1,3})\s*%\s*off",
-            r"off\s*(\d{1,3})\s*%",
-            r"(\d{1,3})\s*%\s*descuento",
-            r"descuento\s*de\s*(\d{1,3})\s*%",
-            r"ahorra\s*(\d{1,3})\s*%",
-        ]
-
-        for padrao in padroes:
-            m = re.search(padrao, t, re.I)
-            if not m:
-                continue
-            try:
-                valor = int(m.group(1))
-            except Exception:
-                continue
-            if 0 < valor < 90:
-                return valor
-
-        return None
-
-    def _extrair_desconto_percentual_do_node(self, node):
-        node = self._normalizar_node(node)
-        if node is None:
-            return None
-
-        texto_total = " ".join(
-            t.strip() for t in node.css("::text").getall() if t and t.strip()
-        )
-        if not texto_total:
-            return None
-
-        texto_total = self._limpar_texto_para_preco(texto_total)
-        return self._extrair_percentual_do_texto(texto_total)
-
-    def _tem_percentual_no_node(self, node):
-        return self._extrair_desconto_percentual_do_node(node) is not None
-
-    def _extrair_preco_riscado_do_node(self, node):
-        node = self._normalizar_node(node)
-        if node is None:
-            return None
-
-        seletores = [
-            "[class*='price_listPrice']::text",
-            "[class*='listPrice']::text",
-            "[class*='price-list-price']::text",
-            "[class*='priceListPrice']::text",
-            "s::text",
-            "del::text",
-            "[style*='line-through']::text",
-            "[class*='strik']::text",
-            "[class*='cross']::text",
-        ]
-
-        candidatos = []
-        for sel in seletores:
-            for txt in node.css(sel).getall():
-                txt = (txt or "").strip()
-                if not txt or self._texto_ignorado_preco(txt):
-                    continue
-                vf = self.preco_str_para_float(txt)
-                if vf is not None:
-                    candidatos.append(vf)
-
-        if candidatos:
-            return max(candidatos)
-
-        texto = " ".join(
-            t.strip() for t in node.css("::text").getall() if t and t.strip()
-        )
-        texto = self._limpar_texto_para_preco(texto)
-        texto_norm = self.normalizar_texto(texto)
-
-        m = re.search(
-            r"\$\s*([\d\.,]+)\s*precio regular",
-            texto_norm,
-            re.I | re.S,
-        )
-        if m:
-            return self.preco_str_para_float(m.group(1))
-
-        return None
-
-    def _extrair_preco_principal_do_node(self, node):
-        node = self._normalizar_node(node)
-        if node is None:
-            return None
-
-        seletores = [
-            "[class*='price_sellingPrice']::text",
-            "[class*='sellingPrice']::text",
-            "[class*='spotPrice']::text",
-            "[class*='bestPrice']::text",
-            "[class*='price-selling-price']::text",
-        ]
-
-        candidatos = []
-        for sel in seletores:
-            for txt in node.css(sel).getall():
-                txt = (txt or "").strip()
-                if not txt or self._texto_ignorado_preco(txt):
-                    continue
-                vf = self.preco_str_para_float(txt)
-                if vf is not None:
-                    candidatos.append(vf)
-
-        if candidatos:
-            return min(candidatos)
-
-        texto = " ".join(
-            t.strip() for t in node.css("::text").getall() if t and t.strip()
-        )
-        texto = self._limpar_texto_para_preco(texto)
-        texto_norm = self.normalizar_texto(texto)
-
-        m = re.search(
-            r"\$\s*([\d\.,]+)\s*-\s*(\d{1,3})%\s*\$\s*([\d\.,]+)\s*precio regular",
-            texto_norm,
-            re.I | re.S,
-        )
-        if m:
-            preco_atual = self.preco_str_para_float(m.group(1))
-            preco_regular = self.preco_str_para_float(m.group(3))
-            if (
-                preco_atual is not None
-                and preco_regular is not None
-                and preco_regular > preco_atual
-            ):
-                return preco_atual
-
-        valores = self._extrair_valores_monetarios_do_node(node)
-        if valores:
-            return min(valores)
-
-        return None
-
-    def _extrair_desconto_percentual_html(self, response_sel):
-        texto_total = "\n".join(
-            t.strip() for t in response_sel.css("body *::text").getall() if t and t.strip()
-        )
-        texto_total = self._limpar_texto_para_preco(texto_total)
-        return self._extrair_percentual_do_texto(texto_total)
-
-    def _extrair_tripla_promocional_do_texto(self, texto):
-        if not texto:
-            return None
-
-        texto_limpo = self._limpar_texto_para_preco(texto)
-        if not texto_limpo:
-            return None
-
-        texto_norm = self.normalizar_texto(texto_limpo)
-
-        padroes = [
-            r"\$\s*([\d\.,]+)\s*-\s*(\d{1,3})%\s*\$\s*([\d\.,]+)\s*precio regular",
-            r"\$\s*([\d\.,]+)\s*-\s*(\d{1,3})%\s*.*?\$\s*([\d\.,]+)\s*precio regular",
-        ]
-
-        for padrao in padroes:
-            m = re.search(padrao, texto_norm, re.I | re.S)
-            if not m:
-                continue
-
-            preco_atual = self.preco_str_para_float(m.group(1))
-            preco_regular = self.preco_str_para_float(m.group(3))
-
-            try:
-                desconto_pct = int(float(m.group(2)))
-            except Exception:
-                desconto_pct = None
-
-            if (
-                preco_atual is not None
-                and preco_regular is not None
-                and desconto_pct is not None
-                and 0 < desconto_pct < 90
-                and preco_regular > preco_atual
-            ):
-                return {
-                    "preco_atual": preco_atual,
-                    "preco_regular": preco_regular,
-                    "desconto_pct": desconto_pct,
-                }
-
-        return None
-
-    def _is_promocao_valida(self, preco_atual, preco_regular, desconto_pct):
-        if preco_atual is None or preco_regular is None or desconto_pct is None:
-            return False
-
-        try:
-            preco_atual = float(preco_atual)
-            preco_regular = float(preco_regular)
-            desconto_pct = int(desconto_pct)
-        except Exception:
-            return False
-
-        if preco_atual <= 0 or preco_regular <= 0:
-            return False
-
-        if preco_regular <= preco_atual:
-            return False
-
-        if not (0 < desconto_pct < 90):
-            return False
-
-        preco_calculado = preco_regular * (1 - desconto_pct / 100.0)
-        diferenca = abs(preco_calculado - preco_atual)
-
-        tolerancia = max(3.0, preco_regular * 0.03)
-        return diferenca <= tolerancia
-
-    def _coletar_precos_html(self, response_sel):
-        resultados = {
-            "precoDe": None,
-            "precoPor": None,
-            "oferta": None,
-            "desconto_percentual": None,
-        }
-
-        blocos_candidatos = []
-        seletores_blocos = [
-            "[class*='vtex-product-price']",
-            "[class*='productPrice']",
-            "[class*='price']",
-            "[class*='Price']",
-            "main",
-            "body",
-        ]
-
-        vistos = set()
-        for sel in seletores_blocos:
-            for node in response_sel.css(sel):
-                node = self._normalizar_node(node)
-                if node is None:
-                    continue
-                chave = node.get()
-                if not chave or chave in vistos:
-                    continue
-                vistos.add(chave)
-                blocos_candidatos.append(node)
-
-        for node in blocos_candidatos:
-            texto_bloco = "\n".join(
-                t.strip() for t in node.css("::text").getall() if t and t.strip()
+            yield scrapy.Request(
+                url=url,
+                callback=self.parse_search,
+                errback=self.errback_search,
+                dont_filter=True,
+                meta={
+                    "ean": ean,
+                    "handle_httpstatus_all": True,
+                },
             )
-            tripla = self._extrair_tripla_promocional_do_texto(texto_bloco)
-            if tripla and self._is_promocao_valida(
-                tripla["preco_atual"],
-                tripla["preco_regular"],
-                tripla["desconto_pct"],
-            ):
-                resultados["precoDe"] = self.float_para_preco_str(tripla["preco_regular"])
-                resultados["precoPor"] = self.float_para_preco_str(tripla["preco_atual"])
-                resultados["desconto_percentual"] = self._formatar_desconto_percentual(
-                    tripla["desconto_pct"]
-                )
-                resultados["oferta"] = "x"
-                return resultados
 
-        candidatos_principais = []
-        seletores_principal = [
-            "[class*='price_sellingPrice']",
-            "[class*='sellingPrice']",
-            "[class*='spotPrice']",
-            "[class*='bestPrice']",
-            "[class*='price-selling-price']",
-        ]
-        for sel in seletores_principal:
-            for node in response_sel.css(sel):
-                vf = self._extrair_preco_principal_do_node(node)
-                if vf is not None:
-                    candidatos_principais.append(vf)
-        preco_principal_global = min(candidatos_principais) if candidatos_principais else None
+    def errback_search(self, failure):
+        ean = failure.request.meta.get("ean")
+        self.logger.info(f"Erro buscando EAN {ean}: {repr(failure.value)}")
+        yield self.empty_item(ean)
 
-        bloco_principal = None
-        for sel in [
-            "[class*='vtex-product-price']",
-            "[class*='productPrice']",
-            "[class*='Price']",
-        ]:
-            candidatos = response_sel.css(sel)
-            if candidatos:
-                bloco_principal = self._normalizar_node(candidatos)
-                break
+    def parse_search(self, response):
+        ean = response.meta["ean"]
 
-        melhor_match = None
-        melhor_desconto = None
-
-        if bloco_principal is not None:
-            desconto_bloco = self._extrair_desconto_percentual_do_node(bloco_principal)
-
-            valores = sorted(self._extrair_valores_monetarios_do_node(bloco_principal))
-            valores_validos = [v for v in valores if 0 < v < 100000]
-
-            if len(valores_validos) >= 2 and desconto_bloco is not None:
-                preco_desc = min(valores_validos)
-                preco_sem_desc = max(valores_validos)
-                if self._is_promocao_valida(preco_desc, preco_sem_desc, desconto_bloco):
-                    melhor_match = (preco_desc, preco_sem_desc)
-                    melhor_desconto = desconto_bloco
-
-            if melhor_match is None:
-                preco_riscado = self._extrair_preco_riscado_do_node(bloco_principal)
-                preco_principal = self._extrair_preco_principal_do_node(bloco_principal)
-                if self._is_promocao_valida(preco_principal, preco_riscado, desconto_bloco):
-                    melhor_match = (preco_principal, preco_riscado)
-                    melhor_desconto = desconto_bloco
-
-        if melhor_match is None:
-            blocos = response_sel.css(
-                """
-                [class*='price'],
-                [class*='Price']
-                """
-            )
-            for node in blocos:
-                node = self._normalizar_node(node)
-                if node is None:
-                    continue
-
-                texto_bloco = "\n".join(
-                    t.strip() for t in node.css("::text").getall() if t and t.strip()
-                )
-                tripla = self._extrair_tripla_promocional_do_texto(texto_bloco)
-                if tripla and self._is_promocao_valida(
-                    tripla["preco_atual"],
-                    tripla["preco_regular"],
-                    tripla["desconto_pct"],
-                ):
-                    melhor_match = (tripla["preco_atual"], tripla["preco_regular"])
-                    melhor_desconto = tripla["desconto_pct"]
-                    break
-
-                desconto_node = self._extrair_desconto_percentual_do_node(node)
-                valores = sorted(self._extrair_valores_monetarios_do_node(node))
-                valores_validos = [v for v in valores if 0 < v < 100000]
-                preco_riscado = self._extrair_preco_riscado_do_node(node)
-                preco_principal = self._extrair_preco_principal_do_node(node)
-
-                if len(valores_validos) >= 2 and desconto_node is not None:
-                    preco_desc = min(valores_validos)
-                    preco_sem_desc = max(valores_validos)
-                    if self._is_promocao_valida(preco_desc, preco_sem_desc, desconto_node):
-                        melhor_match = (preco_desc, preco_sem_desc)
-                        melhor_desconto = desconto_node
-                        break
-
-                if self._is_promocao_valida(preco_principal, preco_riscado, desconto_node):
-                    melhor_match = (preco_principal, preco_riscado)
-                    melhor_desconto = desconto_node
-                    break
-
-        if melhor_match:
-            price_float, list_price_float = melhor_match
-            resultados["precoDe"] = self.float_para_preco_str(list_price_float)
-            resultados["precoPor"] = self.float_para_preco_str(price_float)
-            if melhor_desconto is not None:
-                resultados["desconto_percentual"] = self._formatar_desconto_percentual(melhor_desconto)
-            resultados["oferta"] = "x"
-        elif preco_principal_global is not None:
-            resultados["precoDe"] = self.float_para_preco_str(preco_principal_global)
-
-        return resultados
-
-    def _preco_container_principal(self, response_sel):
-        txt = response_sel.css(
-            ".valtech-carrefourar-product-price-0-x-currencyContainer::text"
-        ).get()
-        if not txt:
-            return None
-        return self.preco_str_para_float(txt)
-
-    def _coletar_precos_card(self, produto):
-        resultados = {
-            "precoDe": None,
-            "precoPor": None,
-            "oferta": None,
-            "desconto_percentual": None,
-        }
-
-        texto_bloco = "\n".join(
-            t.strip() for t in produto.css("::text").getall() if t and t.strip()
-        )
-
-        tripla = self._extrair_tripla_promocional_do_texto(texto_bloco)
-        if tripla and self._is_promocao_valida(
-            tripla["preco_atual"],
-            tripla["preco_regular"],
-            tripla["desconto_pct"],
-        ):
-            resultados["precoDe"] = self.float_para_preco_str(tripla["preco_regular"])
-            resultados["precoPor"] = self.float_para_preco_str(tripla["preco_atual"])
-            resultados["desconto_percentual"] = self._formatar_desconto_percentual(
-                tripla["desconto_pct"]
-            )
-            resultados["oferta"] = "x"
-            return resultados
-
-        preco_principal = self._extrair_preco_principal_do_node(produto)
-        preco_riscado = self._extrair_preco_riscado_do_node(produto)
-        valores = sorted(self._extrair_valores_monetarios_do_node(produto))
-        desconto_pct = self._extrair_desconto_percentual_do_node(produto)
-
-        if self._is_promocao_valida(preco_principal, preco_riscado, desconto_pct):
-            resultados["precoDe"] = self.float_para_preco_str(preco_riscado)
-            resultados["precoPor"] = self.float_para_preco_str(preco_principal)
-            resultados["desconto_percentual"] = self._formatar_desconto_percentual(desconto_pct)
-            resultados["oferta"] = "x"
-            return resultados
-
-        valores_validos = [v for v in valores if 0 < v < 100000]
-        if len(valores_validos) >= 2 and desconto_pct is not None:
-            menor = min(valores_validos)
-            maior = max(valores_validos)
-            if self._is_promocao_valida(menor, maior, desconto_pct):
-                resultados["precoDe"] = self.float_para_preco_str(maior)
-                resultados["precoPor"] = self.float_para_preco_str(menor)
-                resultados["desconto_percentual"] = self._formatar_desconto_percentual(desconto_pct)
-                resultados["oferta"] = "x"
-                return resultados
-
-        if preco_principal is not None:
-            resultados["precoDe"] = self.float_para_preco_str(preco_principal)
-
-        return resultados
-
-    # ---------------- JSON embutido (VTEX) ----------------
-
-    def _extrair_jsons_embutidos(self, response_sel):
-        blobs = []
-
-        for raw_json in response_sel.css('script[type="application/ld+json"]::text').getall():
-            raw_json = (raw_json or "").strip()
-            if not raw_json:
-                continue
-            try:
-                blobs.append(json.loads(raw_json))
-            except Exception:
-                pass
-
-        scripts = response_sel.css("script::text").getall()
-        for txt in scripts:
-            txt = (txt or "").strip()
-            if not txt:
-                continue
-
-            candidatos = [
-                r"__NEXT_DATA__\s*=\s*({.*})\s*;?\s*$",
-                r"window\.__NEXT_DATA__\s*=\s*({.*})\s*;?\s*$",
-                r"__STATE__\s*=\s*({.*})\s*;?\s*$",
-                r"window\.__STATE__\s*=\s*({.*})\s*;?\s*$",
-                r"window\.__PRELOADED_STATE__\s*=\s*({.*})\s*;?\s*$",
-                r"window\.__INITIAL_STATE__\s*=\s*({.*})\s*;?\s*$",
-            ]
-
-            for padrao in candidatos:
-                m = re.search(padrao, txt, re.S)
-                if m:
-                    try:
-                        blobs.append(json.loads(m.group(1)))
-                    except Exception:
-                        pass
-
-            txt_strip = txt.strip()
-            if txt_strip.startswith("{") and txt_strip.endswith("}"):
-                try:
-                    blobs.append(json.loads(txt_strip))
-                except Exception:
-                    pass
-
-        return blobs
-
-    def _coletar_skus_dos_jsons(self, obj, encontrados=None):
-        if encontrados is None:
-            encontrados = []
-
-        if isinstance(obj, dict):
-            tem_itemid = "itemId" in obj
-            tem_sellers = isinstance(obj.get("sellers"), list)
-            tem_ean = "ean" in obj or "referenceId" in obj
-
-            if tem_itemid and (tem_sellers or tem_ean):
-                encontrados.append(obj)
-
-            for v in obj.values():
-                self._coletar_skus_dos_jsons(v, encontrados)
-
-        elif isinstance(obj, list):
-            for item in obj:
-                self._coletar_skus_dos_jsons(item, encontrados)
-
-        return encontrados
-
-    def _extrair_item_por_ean(self, response_sel, ean_buscado):
-        ean_buscado = self._normalizar_ean(ean_buscado)
-        self.logger.info("_extrair_item_por_ean ean_buscado='%s'", ean_buscado)
-
-        if not ean_buscado:
-            return None
-
-        blobs = self._extrair_jsons_embutidos(response_sel)
-        self.logger.info("json blobs encontrados=%d", len(blobs))
-
-        skus = []
-        for blob in blobs:
-            skus.extend(self._coletar_skus_dos_jsons(blob))
-
-        self.logger.info("skus brutos encontrados=%d", len(skus))
-
-        vistos = set()
-        skus_unicos = []
-        for sku in skus:
-            chave = str(sku.get("itemId") or "").strip()
-            if chave and chave not in vistos:
-                vistos.add(chave)
-                skus_unicos.append(sku)
-
-        self.logger.info("skus únicos encontrados=%d", len(skus_unicos))
-
-        for sku in skus_unicos:
-            ean_sku = self._normalizar_ean(sku.get("ean"))
-            refs = sku.get("referenceId") or []
-
-            if ean_sku == ean_buscado:
-                self.logger.info("match por ean direto | itemId='%s'", sku.get("itemId"))
-                return sku
-
-            if isinstance(refs, list):
-                for ref in refs:
-                    if isinstance(ref, dict):
-                        valor = self._normalizar_ean(ref.get("Value") or ref.get("value"))
-                        if valor == ean_buscado:
-                            self.logger.info(
-                                "match por referenceId | itemId='%s'",
-                                sku.get("itemId"),
-                            )
-                            return sku
-
-        if skus_unicos:
-            self.logger.info(
-                "nenhum SKU bateu por EAN, usando fallback primeiro sku | itemId='%s'",
-                skus_unicos[0].get("itemId"),
-            )
-            return skus_unicos[0]
-
-        return None
-
-    def _validar_tripla_produto(
-        self, ean_esperado, sku_esperado, nome_esperado, sku_item, nome_pagina
-    ):
-        ean_ok = False
-        sku_ok = False
-        nome_ok = False
-
-        ean_esperado = self._normalizar_ean(ean_esperado)
-        sku_esperado = self._normalizar_sku(sku_esperado)
-
-        ean_sku = self._normalizar_ean(sku_item.get("ean"))
-        if ean_esperado and ean_sku == ean_esperado:
-            ean_ok = True
-
-        refs = sku_item.get("referenceId") or []
-        if not ean_ok and isinstance(refs, list):
-            for ref in refs:
-                if isinstance(ref, dict):
-                    valor = self._normalizar_ean(ref.get("Value") or ref.get("value"))
-                    if valor == ean_esperado:
-                        ean_ok = True
-                        break
-
-        sku_itemid = self._normalizar_sku(sku_item.get("itemId"))
-        if sku_esperado and sku_itemid and sku_itemid == sku_esperado:
-            sku_ok = True
-
-        nome_item = sku_item.get("name") or ""
-        if nome_esperado and nome_item:
-            if self.nome_parece_produto(nome_esperado) and self.nome_parece_produto(nome_item):
-                if (
-                    self.normalizar_texto(nome_esperado) in self.normalizar_texto(nome_item)
-                    or self.normalizar_texto(nome_item) in self.normalizar_texto(nome_esperado)
-                ):
-                    nome_ok = True
-            elif nome_pagina and nome_item:
-                if (
-                    self.normalizar_texto(nome_pagina) in self.normalizar_texto(nome_item)
-                    or self.normalizar_texto(nome_item) in self.normalizar_texto(nome_pagina)
-                ):
-                    nome_ok = True
-        elif nome_pagina and nome_esperado:
-            if (
-                self.normalizar_texto(nome_pagina) in self.normalizar_texto(nome_esperado)
-                or self.normalizar_texto(nome_esperado) in self.normalizar_texto(nome_pagina)
-            ):
-                nome_ok = True
-
-        self.logger.info(
-            "_validar_tripla_produto ean_ok=%s sku_ok=%s nome_ok=%s | "
-            "ean='%s' sku='%s' nome='%s' nome_pagina='%s' "
-            "itemId='%s' itemEan='%s' itemName='%s'",
-            ean_ok,
-            sku_ok,
-            nome_ok,
-            ean_esperado,
-            sku_esperado,
-            nome_esperado,
-            nome_pagina,
-            sku_item.get("itemId"),
-            sku_item.get("ean"),
-            sku_item.get("name"),
-        )
-
-        if (ean_ok and sku_ok) or nome_ok:
-            return True
-        return False
-
-    def _request_catalog_por_sku(self, sku, ean_atual, item_base):
-        url = self.site_cfg["catalog_sku"].format(sku=quote(str(sku)))
-        self.logger.info("Agendando catalog por sku=%s | %s", sku, url)
-        return Request(
-            url=url,
-            callback=self.parse_catalog_por_sku,
-            dont_filter=True,
-            meta={
-                "ean_atual": str(ean_atual),
-                "item_base": item_base,
-                "sku_encontrado": str(sku),
-            },
-        )
-
-    def parse_catalog_por_sku(self, response):
-        ean_atual = str(response.meta.get("ean_atual") or "").strip()
-        item = response.meta.get("item_base", {}).copy()
-        sku_encontrado = str(response.meta.get("sku_encontrado") or "").strip()
-
-        self.logger.info(
-            "parse_catalog_por_sku status=%s sku=%s ean=%s url=%s",
-            response.status,
-            sku_encontrado,
-            ean_atual,
-            response.url,
-        )
+        if response.status != 200:
+            self.logger.info(f"Resposta HTTP {response.status} para EAN {ean}")
+            yield self.empty_item(ean)
+            return
 
         try:
-            data = json.loads(response.text or "[]")
-        except Exception as exc:
-            self.logger.info("Falha parse json catalog sku=%s error=%s", sku_encontrado, exc)
+            data = json.loads(response.text)
+        except Exception:
+            self.logger.info(f"JSON inválido para EAN {ean}")
+            yield self.empty_item(ean)
             return
 
         if not isinstance(data, list) or not data:
-            self.logger.info("Catalog vazio para sku=%s", sku_encontrado)
+            self.logger.info(f"Nenhum produto encontrado para EAN {ean}")
+            yield self.empty_item(ean)
             return
 
-        sku_item = None
-        nome_pagina = None
-        for prod in data:
-            nome_prod = prod.get("productName") or prod.get("productNameWithBrand")
-            if nome_prod and not nome_pagina:
-                nome_pagina = nome_prod
+        found_product = None
+        found_item = None
 
-            items = prod.get("items") or []
-            for it in items:
-                if str(it.get("itemId") or "").strip() == sku_encontrado:
-                    sku_item = it
+        for product in data:
+            for item in product.get("items", []) or []:
+                item_ean = self.clean_ean(item.get("ean"))
+                if item_ean == ean:
+                    found_product = product
+                    found_item = item
                     break
-            if sku_item:
+            if found_item:
                 break
 
-        if not sku_item:
-            self.logger.info("SKU '%s' não localizado dentro do catalog response", sku_encontrado)
+        if not found_item:
+            self.logger.info(f"Nenhum SKU encontrado para EAN {ean}")
+            yield self.empty_item(ean)
             return
 
-        item["sku"] = sku_encontrado or item.get("sku")
+        sellers = found_item.get("sellers") or []
+        seller = sellers[0] if sellers else {}
+        offer = seller.get("commertialOffer") or {}
 
-        if not item.get("nome"):
-            nome_sku = sku_item.get("name") or nome_pagina
-            if nome_sku:
-                item["nome"] = str(nome_sku).strip()
+        price = self.normalize_price(offer.get("Price"))
+        list_price = self.normalize_price(offer.get("ListPrice"))
 
-        if not item.get("marca") and item.get("nome"):
-            item["marca"] = self.extrair_marca(item["nome"])
+        promo_texts = self.collect_promo_texts(found_product, found_item, offer)
+        desconto_medio = self.extract_second_unit_average_discount(promo_texts)
+        has_promo = self.has_promotion(found_product, found_item, offer, promo_texts)
 
-        tripla_ok = self._validar_tripla_produto(
-            ean_esperado=ean_atual,
-            sku_esperado=sku_encontrado,
-            nome_esperado=item.get("nome"),
-            sku_item=sku_item,
-            nome_pagina=nome_pagina,
+        preco_de = None
+        preco_por = None
+        porcentagem = None
+
+        if has_promo:
+            if desconto_medio is not None and price is not None:
+                preco_de = price
+                preco_por = round(preco_de * (1 - desconto_medio / 100), 2)
+                porcentagem = desconto_medio
+            else:
+                porcentagem = self.extract_discount_dynamic(found_product, found_item, offer)
+
+                if porcentagem is not None and price is not None:
+                    preco_de = price
+                    preco_por = round(preco_de * (1 - porcentagem / 100), 2)
+                else:
+                    if list_price is not None and price is not None and list_price > price:
+                        preco_de = list_price
+                        preco_por = price
+                        porcentagem = self.calc_discount(preco_de, preco_por)
+
+        else:
+            preco_de = price
+            preco_por = price
+
+        oferta = "X" if has_promo and porcentagem else None
+
+        sku = (
+            found_item.get("itemId")
+            or found_product.get("productReference")
+            or found_product.get("productReferenceCode")
         )
-        if not tripla_ok:
-            self.logger.info(
-                "Tripla API catalog não confere | ean=%s sku=%s nome=%s url=%s",
-                ean_atual,
-                sku_encontrado,
-                item.get("nome"),
-                response.url,
-            )
-            return
 
-        sellers = sku_item.get("sellers") or []
-        if isinstance(sellers, list) and sellers and not item.get("precoDe"):
-            for seller in sellers:
-                offer = seller.get("commertialOffer") or {}
-                price_float = self.preco_str_para_float(offer.get("Price"))
-                listprice_float = self.preco_str_para_float(offer.get("ListPrice"))
+        link = found_product.get("link")
+        if link and link.startswith("/"):
+            link = f"https://www.jumbo.com.ar{link}"
 
-                if (
-                    price_float is not None
-                    and listprice_float is not None
-                    and price_float > 0
-                    and listprice_float > 0
-                    and price_float != listprice_float
-                ):
-                    self.logger.info(
-                        "API catalog retornou Price/ListPrice | ean=%s sku=%s valor=%0.2f url=%s",
-                        ean_atual,
-                        sku_encontrado,
-                        price_float,
-                        response.url,
-                    )
-
-                if price_float is not None and price_float > 0:
-                    item["precoDe"] = self.float_para_preco_str(price_float)
-                    break
-
-        if not item.get("precoPor") and item.get("precoDe") and item.get("desconto_percentual"):
-            item["precoPor"] = self._calcular_preco_por_desconto(
-                item.get("precoDe"),
-                item.get("desconto_percentual"),
-            )
-
-        if not item.get("oferta") and item.get("precoPor"):
-            item["oferta"] = "x"
-
-        if not item.get("precoDe"):
-            self.logger.info("Saindo sem precoDe após catalog sku=%s", sku_encontrado)
-            return
-
-        item["link"] = item.get("link") or response.url
-
-        chave_item = (str(item.get("ean")), str(item.get("sku")), str(item.get("link")))
-        if chave_item in self.itens_emitidos:
-            self.logger.info("Item duplicado ignorado %r", chave_item)
-            return
-
-        self.itens_emitidos.add(chave_item)
-        item.setdefault("print_tela_path", None)
-
-        self.logger.info(
-            "Emitindo item final | ean=%s sku=%s nome=%s",
-            item.get("ean"),
-            item.get("sku"),
-            item.get("nome"),
-        )
-        yield item
-
-    # ---------------- Lista de produtos busca ----------------
-
-    def obter_produtos_da_pagina(self, response):
-        response_sel = self._get_html_selector(response)
-
-        seletores_por_loja = {
-            "jumbo_ar": [
-                "article",
-                "[class*='product']",
-                "[class*='Product']",
-                "[class*='vtex-product-summary']",
-                "a[href*='/p']",
-                "a[href*='?_q']",
-            ],
+        item = {
+            "ean": ean,
+            "sku": str(sku) if sku is not None else None,
+            "nome": found_product.get("productName") or found_product.get("productTitle"),
+            "marca": found_product.get("brand"),
+            "precoDe": preco_de,
+            "precoPor": preco_por,
+            "porcentagem": porcentagem,
+            "oferta": oferta,
+            "loja": "Jumbo",
+            "link": link,
         }
 
-        lista = seletores_por_loja.get(self.loja, ["article", "[class*='product']"])
-        vistos = []
-        chaves_vistas = set()
+        self.logger.info(f"Encontrado SKU {item['sku']} para EAN {ean}")
+        self.logger.info(f"Promo textos encontrados: {promo_texts}")
+        self.logger.info(f"Has promo: {has_promo}")
+        self.logger.info(f"Item final: {item}")
 
-        for seletor in lista:
-            for node in response_sel.css(seletor):
-                href = node.css("a::attr(href), ::attr(href)").get()
-                textos = node.css("::text").getall()
-                texto_base = " ".join(textos[:3]).strip() if textos else ""
-                chave = f"{href or ''}|{texto_base}"
-                if chave not in chaves_vistas:
-                    chaves_vistas.add(chave)
-                    vistos.append(node)
+        yield item
 
-        self.logger.info("Produtos encontrados na busca: %d", len(vistos))
-        return vistos
+    def normalize_price(self, value):
+        if value is None:
+            return None
 
-    def extrair_nome_produto_lista(self, produto):
-        seletores_nome = [
-            "[class*='productName']::text",
-            "[class*='product-name']::text",
-            "[class*='ProductName']::text",
-            "[class*='productNameContainer']::text",
-            "[class*='vtex-store-components-3-x-productNameContainer']::text",
-            "h1::text",
-            "h2::text",
-            "h3::text",
-            "h4::text",
-            "[class*='name']::text",
-            "[class*='title']::text",
-            "a::text",
-        ]
-
-        candidatos = []
-        for seletor in seletores_nome:
-            for nome in produto.css(seletor).getall():
-                nome_limpo = self.limpar_nome_candidato(nome)
-                if nome_limpo and nome_limpo not in candidatos:
-                    candidatos.append(nome_limpo)
-
-        for nome_limpo in candidatos:
-            if self.nome_parece_produto(nome_limpo):
-                return nome_limpo
-        return None
-
-    def extrair_link_produto_lista(self, produto, response):
-        response_sel = self._get_html_selector(response)
-        seletores_link = [
-            "a[href*='/producto/']::attr(href)",
-            "a[href*='/p']::attr(href)",
-            "a[href*='?_q']::attr(href)",
-            "a::attr(href)",
-            "::attr(href)",
-        ]
-        for seletor in seletores_link:
-            link = produto.css(seletor).get()
-            if link:
-                return response_sel.urljoin(link)
-        return None
-
-    def extrair_next_page(self, response):
-        response_sel = self._get_html_selector(response)
-        seletores = [
-            "a[rel='next']::attr(href)",
-            "a[aria-label*='Próxima']::attr(href)",
-            "a[aria-label*='Next']::attr(href)",
-            "a[aria-label*='Siguiente']::attr(href)",
-            "a[title*='Next']::attr(href)",
-            "a[title*='Siguiente']::attr(href)",
-            ".pagination a.next::attr(href)",
-            "li.next a::attr(href)",
-        ]
-        for seletor in seletores:
-            next_page = response_sel.css(seletor).get()
-            if next_page:
-                return next_page
-        return None
-
-    def parse_search(self, response):
-        ean_atual = response.meta.get("ean_atual") or self.ean
-        self.logger.info("parse_search url=%s ean=%s", response.url, ean_atual)
-
-        produtos = self.obter_produtos_da_pagina(response)
-
-        for produto in produtos:
-            nome_limpo = self.extrair_nome_produto_lista(produto)
-            if not nome_limpo:
-                continue
-
-            link_absoluto = self.extrair_link_produto_lista(produto, response)
-            if not link_absoluto:
-                continue
-
-            if not self.eh_url_de_produto(link_absoluto):
-                continue
-
-            precos_card = self._coletar_precos_card(produto)
-
-            item_base = {
-                "loja": self.loja,
-                "ean": str(ean_atual),
-                "sku": None,
-                "nome": nome_limpo,
-                "marca": self.extrair_marca(nome_limpo),
-                "precoDe": precos_card.get("precoDe"),
-                "precoPor": precos_card.get("precoPor"),
-                "oferta": precos_card.get("oferta"),
-                "desconto_percentual": precos_card.get("desconto_percentual"),
-                "print_tela_path": None,
-                "link": link_absoluto,
-            }
-
-            self.logger.info("Agendando produto da busca nome=%s | %s", nome_limpo, link_absoluto)
-            yield Request(
-                url=link_absoluto,
-                callback=self.parse_produto,
-                dont_filter=True,
-                meta={
-                    "item_base": item_base,
-                    "ean_atual": ean_atual,
-                    "via_url_direta": False,
-                    "zyte_api_automap": {
-                        "browserHtml": True,
-                        "screenshot": True,
-                    },
-                },
-            )
-
-    def parse_produto(self, response):
-        ean_atual = str(response.meta.get("ean_atual") or self.ean or "").strip()
-        item = (response.meta.get("item_base") or {}).copy()
-        via_url_direta = response.meta.get("via_url_direta", False)
-        response_sel = self._get_html_selector(response)
-
-        if not item.get("nome"):
-            nome_pagina = self.extrair_nome_produto_pagina(response_sel, ean_atual=ean_atual)
-            if nome_pagina:
-                item["nome"] = nome_pagina
-
-        if not item.get("marca") and item.get("nome"):
-            item["marca"] = self.extrair_marca(item["nome"])
-
-        if not item.get("print_tela_path"):
+        if isinstance(value, str):
+            value = value.strip().replace(",", ".")
             try:
-                item["print_tela_path"] = self.salvar_screenshot(item, response)
+                value = float(value)
             except Exception:
-                item["print_tela_path"] = None
+                return None
 
-        sku_item = self._extrair_item_por_ean(response_sel, ean_atual)
-        if not sku_item:
-            self.logger.info("Nenhum sku encontrado na página do produto | ean=%s url=%s", ean_atual, response.url)
-            return
+        if isinstance(value, int):
+            value = float(value)
 
-        sku_encontrado = self._normalizar_sku(sku_item.get("itemId"))
-        if not sku_encontrado:
-            self.logger.info("SKU vazio após extração | ean=%s url=%s", ean_atual, response.url)
-            return
+        if not isinstance(value, float):
+            return None
 
-        item["sku"] = sku_encontrado
-        item["link"] = item.get("link") or response.url
+        if value >= 100000:
+            value = value / 100
 
-        precos_html = self._coletar_precos_html(response_sel)
+        return round(value, 2)
 
-        if via_url_direta:
-            if not item.get("precoDe") and precos_html.get("precoDe"):
-                item["precoDe"] = precos_html.get("precoDe")
-            if not item.get("desconto_percentual") and precos_html.get("desconto_percentual") is not None:
-                item["desconto_percentual"] = precos_html.get("desconto_percentual")
-            if not item.get("precoPor") and precos_html.get("precoPor"):
-                item["precoPor"] = precos_html.get("precoPor")
-            if not item.get("oferta") and precos_html.get("oferta"):
-                item["oferta"] = precos_html.get("oferta")
-        else:
-            if precos_html.get("precoDe"):
-                item["precoDe"] = precos_html.get("precoDe")
-            if precos_html.get("desconto_percentual") is not None:
-                item["desconto_percentual"] = precos_html.get("desconto_percentual")
-            if precos_html.get("precoPor"):
-                item["precoPor"] = precos_html.get("precoPor")
-            if precos_html.get("oferta"):
-                item["oferta"] = precos_html.get("oferta")
+    def collect_promo_texts(self, product, item, offer):
+        possible_values = [
+            offer.get("discountHighlights"),
+            offer.get("DiscountHighLight"),
+            offer.get("teasers"),
+            offer.get("Teasers"),
+            product.get("clusterHighlights"),
+            product.get("productClusters"),
+            product.get("properties"),
+            item.get("referenceId"),
+        ]
 
-        if not item.get("precoPor") and item.get("precoDe") and item.get("desconto_percentual"):
-            item["precoPor"] = self._calcular_preco_por_desconto(
-                item.get("precoDe"),
-                item.get("desconto_percentual"),
-            )
+        texts = []
+        for value in possible_values:
+            texts.extend(self.extract_texts_from_any(value))
 
-        if not item.get("oferta") and item.get("precoPor"):
-            item["oferta"] = "x"
+        cleaned = []
+        seen = set()
 
-        yield self._request_catalog_por_sku(
-            sku=sku_encontrado,
-            ean_atual=ean_atual,
-            item_base=item,
-        )
+        for text in texts:
+            s = re.sub(r"\s+", " ", str(text)).strip()
+            if not s:
+                continue
+            if s.lower() in seen:
+                continue
+            seen.add(s.lower())
+            cleaned.append(s)
+
+        return cleaned
+
+    def extract_texts_from_any(self, value):
+        if value is None:
+            return []
+
+        if isinstance(value, str):
+            return [value]
+
+        texts = []
+
+        if isinstance(value, dict):
+            for v in value.values():
+                texts.extend(self.extract_texts_from_any(v))
+            return texts
+
+        if isinstance(value, list):
+            for v in value:
+                texts.extend(self.extract_texts_from_any(v))
+            return texts
+
+        return []
+
+    def extract_second_unit_average_discount(self, texts):
+        if not texts:
+            return None
+
+        for text in texts:
+            s = str(text).strip()
+
+            match = re.search(r"2do\s+al\s+(\d{1,3})\s*%", s, flags=re.IGNORECASE)
+            if not match:
+                match = re.search(r"2do\s+al\s+(\d{1,3})\b", s, flags=re.IGNORECASE)
+
+            if match:
+                try:
+                    second_unit_discount = int(match.group(1))
+                    if 0 < second_unit_discount <= 100:
+                        return round(second_unit_discount / 2)
+                except Exception:
+                    return None
+
+        return None
+
+    def has_promotion(self, product, item, offer, promo_texts=None):
+        if promo_texts:
+            for text in promo_texts:
+                s = str(text).strip()
+                if not s:
+                    continue
+
+                if re.search(r"\d{1,3}\s*%", s):
+                    return True
+
+                if re.search(r"\b(2do|segunda|segundo)\b", s, flags=re.IGNORECASE):
+                    return True
+
+        promo_sources = [
+            offer.get("discountHighlights"),
+            offer.get("DiscountHighLight"),
+            offer.get("teasers"),
+            offer.get("Teasers"),
+            product.get("clusterHighlights"),
+            product.get("productClusters"),
+            product.get("properties"),
+            item.get("referenceId"),
+        ]
+
+        for value in promo_sources:
+            if self.value_has_meaningful_content(value):
+                if self.parse_percentage_from_any(value) is not None:
+                    return True
+
+                texts = self.extract_texts_from_any(value)
+                for text in texts:
+                    s = str(text).strip()
+                    if not s:
+                        continue
+                    if re.search(r"\b(2do|segunda|segundo)\b", s, flags=re.IGNORECASE):
+                        return True
+
+        return False
+
+    def value_has_meaningful_content(self, value):
+        if value is None:
+            return False
+
+        if isinstance(value, str):
+            return bool(value.strip())
+
+        if isinstance(value, dict):
+            return any(self.value_has_meaningful_content(v) for v in value.values())
+
+        if isinstance(value, list):
+            return any(self.value_has_meaningful_content(v) for v in value)
+
+        return False
+
+    def extract_discount_dynamic(self, product, item, offer):
+        possible_values = [
+            offer.get("discountHighlights"),
+            offer.get("DiscountHighLight"),
+            offer.get("teasers"),
+            offer.get("Teasers"),
+            product.get("clusterHighlights"),
+            product.get("productClusters"),
+            product.get("properties"),
+            item.get("referenceId"),
+        ]
+
+        for value in possible_values:
+            pct = self.parse_percentage_from_any(value)
+            if pct is not None:
+                return pct
+
+        return None
+
+    def parse_percentage_from_any(self, value):
+        if value is None:
+            return None
+
+        if isinstance(value, str):
+            return self.parse_percentage(value)
+
+        if isinstance(value, dict):
+            for v in value.values():
+                pct = self.parse_percentage_from_any(v)
+                if pct is not None:
+                    return pct
+
+        if isinstance(value, list):
+            for v in value:
+                pct = self.parse_percentage_from_any(v)
+                if pct is not None:
+                    return pct
+
+        return None
+
+    def parse_percentage(self, value):
+        if not value:
+            return None
+
+        s = str(value).strip()
+        match = re.search(r"(\d{1,3})\s*%", s)
+        if match:
+            try:
+                pct = int(match.group(1))
+                if 0 < pct <= 100:
+                    return pct
+            except Exception:
+                return None
+
+        return None
+
+    def calc_discount(self, preco_de, preco_por):
+        if preco_de is None or preco_por is None:
+            return None
+        if preco_de <= preco_por:
+            return None
+        return round(((preco_de - preco_por) / preco_de) * 100)
+
+    def empty_item(self, ean):
+        return {
+            "ean": ean,
+            "sku": None,
+            "nome": None,
+            "marca": None,
+            "precoDe": None,
+            "precoPor": None,
+            "porcentagem": None,
+            "oferta": None,
+            "loja": "Jumbo",
+            "link": None,
+        }
