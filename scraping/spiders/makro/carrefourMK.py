@@ -1,9 +1,8 @@
 import csv
 import json
 import re
-import unicodedata
 from pathlib import Path
-from urllib.parse import quote, urljoin
+from urllib.parse import quote
 
 import scrapy
 from scrapy import Request
@@ -19,148 +18,36 @@ except ImportError:
     PageMethod = None
 
 
-class CarrefourPrecoSpider(scrapy.Spider):
-    name = "carrefour_preco"
+class CarrefourMRSpider(scrapy.Spider):
+    name = "carrefour_mk"
     allowed_domains = ["www.carrefour.com.ar", "carrefour.com.ar"]
 
     custom_settings = {
         "CONCURRENT_REQUESTS_PER_DOMAIN": 2,
-        "DOWNLOAD_DELAY": 0.4,
+        "DOWNLOAD_DELAY": 0.3,
         "DOWNLOAD_TIMEOUT": 60,
         "LOG_LEVEL": "INFO",
         "COOKIES_ENABLED": True,
     }
 
-    PASTA_LEITURA = Path(r"C:\Users\felpa\OneDrive\Área de Trabalho\trabalho\leitura")
-    ARQUIVO_PADRAO = PASTA_LEITURA / "BASE RETAIL MINORISTA 23_02_2026.xlsx"
-
-    PROMO_PATTERNS = [
-        {
-            "tipo": "nxm",
-            "regex": re.compile(
-                r"\b(\d+)\s*[xX]\s*(\d+)\b|"
-                r"\bleve\s+(\d+)\s+(?:e\s+)?pague\s+(\d+)\b|"
-                r"\blleva\s+(\d+)\s+y?\s*paga\s+(\d+)\b|"
-                r"\bna\s+compra\s+de\s+(\d+)\s+(?:unidades?\s+)?pague\s+(\d+)\b|"
-                r"\bcomprando\s+(\d+)\s+(?:unidades?\s+)?pague\s+(\d+)\b",
-                re.I,
-            ),
-        },
-        {
-            "tipo": "compre_leve",
-            "regex": re.compile(
-                r"\bcompre\s+(\d+)\s+(?:e\s+)?leve\s+(\d+)\b|"
-                r"\bcompra\s+(\d+)\s+y?\s*lleva\s+(\d+)\b|"
-                r"\blevando\s+(\d+)\s+(?:ganha|leve)\s+(\d+)\b|"
-                r"\bll(evando|evando)\s+(\d+)\s+(?:te\s+)?llevas\s+(\d+)\b",
-                re.I,
-            ),
-        },
-        {
-            "tipo": "ultimo_gratis",
-            "regex": re.compile(
-                r"\bna\s+compra\s+de\s+(\d+)\s+.*?(ultimo|último)\s+(?:sai\s+)?gratis\b|"
-                r"\bcomprando\s+(\d+)\s+.*?(ultimo|último)\s+(?:sai\s+)?gratis\b|"
-                r"\ben\s+la\s+compra\s+de\s+(\d+)\s+.*?(ultimo|último)\s+(?:sale\s+)?gratis\b|"
-                r"\bllevando\s+(\d+)\s+.*?(ultimo|último)\s+(?:sale\s+)?gratis\b",
-                re.I,
-            ),
-        },
-        {
-            "tipo": "segunda_unidade_percentual",
-            "regex": re.compile(
-                r"\b(2da|2do|segunda|segundo)\s+unidad(?:e)?\s*(?:a|al|com|con|c\/)?\s*(\d{1,3})\s*%\b|"
-                r"\b(2da|2do|segunda|segundo)\s+unidad(?:e)?\s+(?:con|com)\s+(\d{1,3})\s*%\s+de\s+descuento\b|"
-                r"\b(segunda|segundo)\s+unidade\s+com\s+(\d{1,3})\s*%\b",
-                re.I,
-            ),
-        },
-        {
-            "tipo": "desconto_percentual",
-            "regex": re.compile(
-                r"\b(\d{1,3})\s*%\s*(?:off|dto|descuento|desconto)\b|"
-                r"\bahorra\s+(\d{1,3})\s*%\b|"
-                r"\beconomiza\s+(\d{1,3})\s*%\b",
-                re.I,
-            ),
-        },
-        {
-            "tipo": "quantidade_minima",
-            "regex": re.compile(
-                r"\ba\s+partir\s+de\s+(\d+)\s+unidades?\b|"
-                r"\bllevando\s+(\d+)\s+unidades?\b|"
-                r"\bna\s+compra\s+de\s+(\d+)\s+unidades?\b|"
-                r"\bcomprando\s+(\d+)\s+unidades?\b|"
-                r"\b(\d+)\s+ou\s+mais\b|"
-                r"\b(\d+)\s+o\s+mas\b",
-                re.I,
-            ),
-        },
-        {
-            "tipo": "pack_combo",
-            "regex": re.compile(
-                r"\bpack\b|\bcombo\b|\bcombinable(?:s)?\b|\bcombinado(?:s)?\b|"
-                r"\bahorro\b|\bpromo(?:cion)?\b",
-                re.I,
-            ),
-        },
+    PALAVRAS_RUINS = [
+        "off", "descuento", "descuentos", "promocion", "promoción", "promociones",
+        "oferta", "ofertas", "seleccionados", "categorias", "categorías",
+        "semana", "billetera", "beneficio", "ahorro", "hasta "
     ]
 
-    PRICE_KEYS = {
-        "price", "pricevalue", "pricenow", "sellingprice", "spotprice", "bestprice",
-        "value", "saleprice", "pricetoview", "offerprice"
-    }
-    LIST_PRICE_KEYS = {
-        "listprice", "pricewithoutdiscount", "referenceprice", "compareatprice",
-        "strikethroughprice", "oldprice", "regularprice"
-    }
+    PASTA_LEITURA = Path(r"C:\Users\Felipe Braga\Desktop\trabalho\WebScraping\scraping\Leitura")
+    ARQUIVO_PADRAO = PASTA_LEITURA / "Makro Mensual - PS y SS-SE ACTUALIZADO - PRECIOS.xlsx"
 
-    IGNORAR_TRECHOS_PRECO = [
-        "cuotas sin interés",
-        "cuotas sin interes",
-        "csi",
-        "mi carrefour crédito",
-        "mi carrefour credito",
-        "adicional",
-        "off en 1 pago",
-        "sin impuestos nacionales",
-        "precio sin impuestos nacionales",
-        "hot sale",
-        "imperdibles",
-        "envío gratis",
-        "envio gratis",
-    ]
-
-    def __init__(self, arquivo_entrada=None, ean=None, usar_playwright="0", *args, **kwargs):
+    def __init__(self, arquivo_entrada=None, ean=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.ean = ean
-        self.usar_playwright = str(usar_playwright).strip().lower() in ("1", "true", "yes", "sim")
         self.arquivo_entrada = Path(arquivo_entrada) if arquivo_entrada else self.ARQUIVO_PADRAO
+        self.ean = ean
 
-    # ---------------- start ----------------
+        if not self.arquivo_entrada and not self.ean:
+            raise ValueError("Passe arquivo_entrada ou ean")
 
-    def start_requests(self):
-        eans = []
-
-        if self.ean:
-            ean = self.sanitize_ean(self.ean)
-            if self.ean_valido(ean):
-                eans.append(ean)
-        elif self.arquivo_entrada:
-            eans.extend(self.ler_eans_arquivo(self.arquivo_entrada))
-
-        eans = list(dict.fromkeys([e for e in eans if self.ean_valido(e)]))
-
-        for ean in eans:
-            api_url = self.build_api_ean_url(ean)
-            yield Request(
-                api_url,
-                callback=self.parse_api,
-                meta={"ean": ean, "api_kind": "ean"},
-                dont_filter=True,
-            )
-
-    # ---------------- leitura ----------------
+    # ---------------- caminhos ----------------
 
     def resolver_caminho_arquivo(self, arquivo_entrada):
         caminho = Path(arquivo_entrada)
@@ -174,6 +61,8 @@ class CarrefourPrecoSpider(scrapy.Spider):
                 return candidato
 
         raise FileNotFoundError(f"Arquivo não encontrado: {caminho}")
+
+    # ---------------- leitura ----------------
 
     def ler_eans_csv(self, caminho: Path):
         eans = []
@@ -202,7 +91,7 @@ class CarrefourPrecoSpider(scrapy.Spider):
             for row in reader:
                 valor = (row.get(coluna_ean) or "").strip()
                 if valor:
-                    eans.append(self.sanitize_ean(valor))
+                    eans.append(valor)
 
         return list(dict.fromkeys(eans))
 
@@ -212,6 +101,7 @@ class CarrefourPrecoSpider(scrapy.Spider):
 
         wb = openpyxl.load_workbook(str(caminho), read_only=True, data_only=True)
         ws = wb[wb.sheetnames[0]]
+
         rows = list(ws.iter_rows(values_only=True))
         wb.close()
 
@@ -222,17 +112,20 @@ class CarrefourPrecoSpider(scrapy.Spider):
         for i, row in enumerate(rows):
             if not row:
                 continue
-            vals = [str(c).strip().lower() if c is not None else "" for c in row]
-            if any("ean" in v for v in vals):
+
+            if any(c is not None and str(c).strip() for c in row):
+                header_candidate = [str(c).strip().lower() if c is not None else "" for c in row]
+                if not any("ean" in h for h in header_candidate):
+                    continue
                 header_row_idx = i
                 break
 
         if header_row_idx is None:
-            raise ValueError("Não encontrei cabeçalho com EAN.")
+            raise ValueError("Não encontrei linha de cabeçalho com coluna EAN na planilha.")
 
         header = [str(h).strip() if h is not None else "" for h in rows[header_row_idx]]
-        header_norm = [h.lower() for h in header]
-        nomes = {c: idx for idx, c in enumerate(header_norm)}
+        header_normalizado = [h.lower() for h in header]
+        nomes = {c: idx for idx, c in enumerate(header_normalizado)}
 
         idx_ean = None
         for chave in [
@@ -252,14 +145,35 @@ class CarrefourPrecoSpider(scrapy.Spider):
         if idx_ean is None:
             raise ValueError(f"Não encontrei coluna EAN no XLSX. Cabeçalho: {header}")
 
+        idx_mercado = None
+        candidatos_mercado = [
+            "competidor",
+            "competidor ",
+            "supermercado",
+            "mercado",
+            "cliente",
+        ]
+        for nome_coluna, idx in nomes.items():
+            if nome_coluna in candidatos_mercado:
+                idx_mercado = idx
+                break
+
         eans = []
         for row in rows[header_row_idx + 1:]:
             if row is None or idx_ean >= len(row):
                 continue
+
+            if idx_mercado is not None and idx_mercado < len(row):
+                mercado_val = row[idx_mercado]
+                mercado_txt = str(mercado_val or "").lower()
+                if "carrefour" not in mercado_txt:
+                    continue
+
             valor = row[idx_ean]
             if valor is None:
                 continue
-            valor = self.sanitize_ean(valor)
+
+            valor = str(valor).strip()
             if valor:
                 eans.append(valor)
 
@@ -267,14 +181,17 @@ class CarrefourPrecoSpider(scrapy.Spider):
 
     def ler_eans_arquivo(self, arquivo_entrada):
         caminho = self.resolver_caminho_arquivo(arquivo_entrada)
+
         self.logger.info("Arquivo de entrada localizado em: %s", caminho)
 
         if caminho.suffix.lower() == ".csv":
-            return self.ler_eans_csv(caminho)
-        if caminho.suffix.lower() == ".xlsx":
-            return self.ler_eans_xlsx(caminho)
+            eans = self.ler_eans_csv(caminho)
+        elif caminho.suffix.lower() == ".xlsx":
+            eans = self.ler_eans_xlsx(caminho)
+        else:
+            raise ValueError("Use arquivo .csv ou .xlsx")
 
-        raise ValueError("Use arquivo .csv ou .xlsx")
+        return eans
 
     # ---------------- utils ----------------
 
@@ -284,778 +201,802 @@ class CarrefourPrecoSpider(scrapy.Spider):
     def ean_valido(self, ean):
         return bool(ean) and len(ean) in (8, 12, 13, 14)
 
+    def parse_price(self, value):
+        if value is None:
+            return None
+
+        if isinstance(value, (int, float)):
+            return float(value)
+
+        texto = str(value).strip()
+        texto = texto.replace("$", "").replace("\xa0", " ")
+        texto = texto.replace(".", "").replace(",", ".")
+        texto = re.sub(r"[^\d.]", "", texto)
+
+        try:
+            return float(texto) if texto else None
+        except Exception:
+            return None
+
     def normalize_text(self, value):
         if value is None:
             return None
         value = re.sub(r"\s+", " ", str(value)).strip()
         return value or None
 
-    def strip_accents(self, text):
-        if not text:
-            return ""
-        return "".join(
-            ch for ch in unicodedata.normalize("NFKD", str(text))
-            if not unicodedata.combining(ch)
-        )
+    def texto_ruim(self, texto):
+        if not texto:
+            return False
+        t = texto.lower()
+        return any(p in t for p in self.PALAVRAS_RUINS)
 
-    def normalize_promo_text(self, text):
-        text = self.strip_accents(text or "")
-        text = text.lower().replace("\xa0", " ")
-        text = re.sub(r"\s+", " ", text).strip()
-        return text
-
-    def parse_price(self, value):
-        if value is None:
+    def clean_nome(self, nome, ean):
+        nome = self.normalize_text(nome)
+        if not nome:
             return None
 
-        if isinstance(value, (int, float)):
-            v = float(value)
-            if v <= 0:
-                return None
-            return v
+        nome_limpo = re.sub(r"\s*-\s*Carrefour\s*$", "", nome, flags=re.I).strip()
 
-        texto = str(value)
-        texto = texto.replace("\xa0", " ")
-        texto = re.sub(r"\s+", "", texto)
-        texto = texto.replace("$", "")
-
-        m = re.search(r"(\d{1,3}(?:\.\d{3})+,\d{2}|\d{1,3}(?:\.\d{3})+|\d+,\d{2}|\d+\.\d{2}|\d+)", texto)
-        if not m:
+        if ean and re.sub(r"\D", "", nome_limpo) == str(ean):
             return None
 
-        texto = m.group(1)
-
-        if "," in texto and "." in texto:
-            texto = texto.replace(".", "").replace(",", ".")
-        elif "," in texto:
-            texto = texto.replace(".", "").replace(",", ".")
-        else:
-            if texto.count(".") > 1:
-                texto = texto.replace(".", "")
-            elif re.match(r"^\d{1,3}(?:\.\d{3})+$", texto):
-                texto = texto.replace(".", "")
-
-        try:
-            v = float(texto)
-            if v <= 0:
-                return None
-            return v
-        except Exception:
+        if ean and nome_limpo == f"{ean} - Carrefour":
             return None
+
+        if self.texto_ruim(nome_limpo):
+            return None
+
+        return nome_limpo
+
+    def pick_best_seller(self, sellers):
+        if not sellers:
+            return None
+
+        melhor = None
+        melhor_preco = None
+
+        for seller in sellers:
+            offer = seller.get("commertialOffer") or {}
+
+            preco = (
+                offer.get("Price")
+                or offer.get("spotPrice")
+                or offer.get("ListPrice")
+                or offer.get("PriceWithoutDiscount")
+            )
+
+            if preco is None:
+                continue
+
+            if melhor is None or preco < melhor_preco:
+                melhor = seller
+                melhor_preco = preco
+
+        return melhor or sellers[0]
+
+    def build_search_url(self, ean):
+        return f"https://www.carrefour.com.ar/{quote(ean)}?_q={quote(ean)}&map=ft"
 
     def build_api_ean_url(self, ean):
         fq = quote(f"alternateIds_Ean:{ean}", safe="")
         return f"https://www.carrefour.com.ar/api/catalog_system/pub/products/search?fq={fq}"
 
     def build_api_ft_url(self, ean):
-        return f"https://www.carrefour.com.ar/api/catalog_system/pub/products/search?ft={quote(ean, safe='')}"
-
-    def build_search_url(self, ean):
-        return f"https://www.carrefour.com.ar/{quote(ean)}?_q={quote(ean)}&map=ft"
+        ft = quote(ean, safe="")
+        return f"https://www.carrefour.com.ar/api/catalog_system/pub/products/search?ft={ft}"
 
     def is_pdp_url(self, url):
         if not url:
             return False
         base = url.split("?")[0]
-        return base.endswith("/p") or "/p/" in base or "idsku=" in url
+        return base.endswith("/p") or "/p/" in base or base.endswith("/p")
 
-    def abs_url(self, url):
-        if not url:
-            return None
-        return urljoin("https://www.carrefour.com.ar", url)
+    def normalize_prices(self, preco=None, preco_por=None, preco_de=None):
+        preco = self.parse_price(preco)
+        preco_por = self.parse_price(preco_por)
+        preco_de = self.parse_price(preco_de)
 
-    def get_default_seller(self, product):
-        sellers = product.get("items", [{}])[0].get("sellers", [])
-        if not sellers:
-            return {}
-        return next((s for s in sellers if s.get("sellerDefault")), sellers[0])
+        if preco_por is not None and preco_de is not None and preco_de > preco_por:
+            return {
+                "preco": preco_por,
+                "precoPor": preco_por,
+                "precoDe": preco_de,
+                "oferta": "x",
+            }
 
-    def get_offer(self, product):
-        seller = self.get_default_seller(product)
-        return seller.get("commertialOffer") or {}
-
-    def extract_json_ld_blocks(self, response):
-        blocos = []
-        for raw in response.css('script[type="application/ld+json"]::text').getall():
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                data = json.loads(raw)
-                blocos.append(data)
-            except Exception:
-                continue
-        return blocos
-
-    def find_offer_in_jsonld(self, data):
-        if isinstance(data, dict):
-            if data.get("@type") == "Offer":
-                return data
-            for v in data.values():
-                achou = self.find_offer_in_jsonld(v)
-                if achou:
-                    return achou
-        elif isinstance(data, list):
-            for item in data:
-                achou = self.find_offer_in_jsonld(item)
-                if achou:
-                    return achou
-        return None
-
-    def extract_embedded_json_objects(self, response):
-        encontrados = []
-
-        scripts = response.css("script::text").getall()
-        for raw in scripts:
-            if not raw:
-                continue
-
-            raw = raw.strip()
-            if not raw:
-                continue
-
-            candidatos = [
-                r'__NEXT_DATA__\s*=\s*({.*?})\s*;?\s*$',
-                r'window\.__STATE__\s*=\s*({.*?})\s*;?\s*$',
-                r'window\.__INITIAL_STATE__\s*=\s*({.*?})\s*;?\s*$',
-                r'__PRELOADED_STATE__\s*=\s*({.*?})\s*;?\s*$',
-            ]
-
-            for pat in candidatos:
-                m = re.search(pat, raw, re.S | re.M)
-                if not m:
-                    continue
-                try:
-                    encontrados.append(json.loads(m.group(1)))
-                except Exception:
-                    pass
-
-            if raw.startswith("{") and raw.endswith("}"):
-                try:
-                    encontrados.append(json.loads(raw))
-                except Exception:
-                    pass
-
-        return encontrados
-
-    def walk_prices(self, obj, path="root", out=None):
-        if out is None:
-            out = []
-
-        if isinstance(obj, dict):
-            lowered = {str(k).lower(): v for k, v in obj.items()}
-
-            for k, v in lowered.items():
-                preco = self.parse_price(v)
-                if preco is None:
-                    continue
-
-                if k in self.PRICE_KEYS:
-                    out.append({"tipo": "precoPor", "valor": preco, "path": f"{path}.{k}"})
-                elif k in self.LIST_PRICE_KEYS:
-                    out.append({"tipo": "precoDe", "valor": preco, "path": f"{path}.{k}"})
-
-            for k, v in obj.items():
-                self.walk_prices(v, f"{path}.{k}", out)
-
-        elif isinstance(obj, list):
-            for i, item in enumerate(obj):
-                self.walk_prices(item, f"{path}[{i}]", out)
-
-        return out
-
-    def filtrar_texto_ruim_preco(self, texto):
-        t = self.normalize_promo_text(texto)
-        return any(x in t for x in self.IGNORAR_TRECHOS_PRECO)
-
-    def is_unavailable_text(self, text):
-        if not text:
-            return False
-
-        txt = self.normalize_promo_text(text)
-        gatilhos = [
-            "no disponible",
-            "produto indisponivel",
-            "producto no disponible",
-            "sin stock",
-            "agotado",
-            "out of stock",
-        ]
-        return any(g in txt for g in gatilhos)
-
-    def mark_unavailable(self, item):
-        item["preco"] = 0.0
-        item["precoPor"] = 0.0
-        item["precoDe"] = 0.0
-        item["oferta"] = None
-        item["desconto_percentual"] = None
-        item["indisponivel"] = 1
-        return item
-
-    def extract_price_candidates_from_text(self, text, skip_combo_promos=False):
-        if not text:
-            return []
-
-        text = text.replace("\xa0", " ")
-        text = re.sub(r"\s+", " ", text)
-
-        padrao = r"\$\s*\d[\d\s\.\,]*\d"
-        candidatos = []
-
-        for match in re.finditer(padrao, text):
-            trecho = match.group(0)
-            janela = text[max(0, match.start()-80):min(len(text), match.end()+80)]
-
-            if self.filtrar_texto_ruim_preco(janela):
-                continue
-
-            preco = self.parse_price(trecho)
-            if preco is not None:
-                candidatos.append(preco)
-
-        unicos = []
-        for v in candidatos:
-            if v not in unicos:
-                unicos.append(v)
-        return unicos
-
-    def detect_promotions(self, text):
-        if not text:
-            return []
-
-        texto = self.normalize_promo_text(text)
-        encontrados = []
-
-        for spec in self.PROMO_PATTERNS:
-            for m in spec["regex"].finditer(texto):
-                trecho = texto[max(0, m.start() - 100):min(len(texto), m.end() + 140)]
-                precos = self.extract_price_candidates_from_text(trecho, skip_combo_promos=False)
-                grupos = [g for g in m.groups() if g is not None]
-
-                promo = {
-                    "tipo": spec["tipo"],
-                    "match": m.group(0),
-                    "texto_contexto": trecho[:350],
-                    "grupos": grupos,
-                    "preco_unitario": precos[0] if precos else None,
-                    "preco_total": precos[1] if len(precos) > 1 else None,
-                }
-
-                nums = [int(g) for g in grupos if str(g).isdigit()]
-
-                if spec["tipo"] == "nxm" and len(nums) >= 2:
-                    promo["qtd_leva"] = nums[0]
-                    promo["qtd_paga"] = nums[1]
-                    promo["mecanica"] = f"leve_{nums[0]}_pague_{nums[1]}"
-
-                elif spec["tipo"] == "compre_leve" and len(nums) >= 2:
-                    promo["qtd_compra"] = nums[0]
-                    promo["qtd_leva"] = nums[1]
-                    promo["mecanica"] = f"compre_{nums[0]}_leve_{nums[1]}"
-
-                elif spec["tipo"] == "ultimo_gratis" and len(nums) >= 1:
-                    promo["qtd_acionadora"] = nums[0]
-                    promo["mecanica"] = f"na_compra_de_{nums[0]}_ultimo_gratis"
-
-                elif spec["tipo"] == "segunda_unidade_percentual" and len(nums) >= 1:
-                    promo["percentual"] = nums[-1]
-                    promo["mecanica"] = f"segunda_unidade_{nums[-1]}_percent"
-
-                elif spec["tipo"] == "desconto_percentual" and len(nums) >= 1:
-                    promo["percentual"] = nums[0]
-                    promo["mecanica"] = f"desconto_{nums[0]}_percent"
-
-                elif spec["tipo"] == "quantidade_minima" and len(nums) >= 1:
-                    promo["quantidade_minima"] = nums[0]
-                    promo["mecanica"] = f"quantidade_minima_{nums[0]}"
-
-                elif spec["tipo"] == "pack_combo":
-                    promo["mecanica"] = "pack_combo"
-
-                encontrados.append(promo)
-
-        unicos = []
-        vistos = set()
-        for p in encontrados:
-            chave = (p.get("tipo"), p.get("match"))
-            if chave not in vistos:
-                vistos.add(chave)
-                unicos.append(p)
-
-        return unicos
-
-    def extract_prices_from_dom(self, response):
-        blocos = []
-
-        seletores_precisos = [
-            "[class*='sellingPrice'] *::text",
-            "[class*='listPrice'] *::text",
-            "[class*='priceContainer'] *::text",
-            "[class*='price_'] *::text",
-            "[data-testid*='price'] *::text",
-            "[class*='spotPrice'] *::text",
-            "[class*='productPrice'] *::text",
-            "[class*='currencyContainer'] *::text",
-            "[class*='savings'] *::text",
-            "[class*='promo'] *::text",
-            "[class*='discount'] *::text",
-            "[class*='benefit'] *::text",
-            "section *::text",
-            "article *::text",
-        ]
-
-        for sel in seletores_precisos:
-            vals = response.css(sel).getall()
-            if vals:
-                texto = " ".join([v.strip() for v in vals if v and v.strip()])
-                texto = re.sub(r"\s+", " ", texto).strip()
-                if texto:
-                    blocos.append(texto)
-
-        blocos_filtrados = []
-        for b in blocos:
-            if len(b) < 4:
-                continue
-            blocos_filtrados.append(b)
-
-        melhores_precos = []
-        todas_promos = []
-
-        for bloco in blocos_filtrados[:80]:
-            precos = self.extract_price_candidates_from_text(bloco)
-            promos = self.detect_promotions(bloco)
-
-            if precos:
-                melhores_precos.append({
-                    "texto": bloco[:500],
-                    "precos": precos[:5],
-                    "qtd": len(precos),
-                })
-
-            if promos:
-                todas_promos.extend(promos)
-
-        preco_por = None
-        preco_de = None
-
-        if melhores_precos:
-            candidatos = []
-            for reg in melhores_precos:
-                for p in reg["precos"]:
-                    candidatos.append(p)
-
-            candidatos = [x for x in candidatos if x is not None]
-            candidatos_unicos = []
-            for x in candidatos:
-                if x not in candidatos_unicos:
-                    candidatos_unicos.append(x)
-
-            if candidatos_unicos:
-                preco_por = min(candidatos_unicos)
-                maior = max(candidatos_unicos)
-                if maior > preco_por:
-                    preco_de = maior
-
-        promos_unicas = []
-        vistos = set()
-        for p in todas_promos:
-            chave = (p.get("tipo"), p.get("match"))
-            if chave not in vistos:
-                vistos.add(chave)
-                promos_unicas.append(p)
-
-        texto_debug = " || ".join([x["texto"] for x in melhores_precos[:8]])[:2000] if melhores_precos else None
+        preco_final = preco_por if preco_por is not None else preco_de if preco_de is not None else preco
 
         return {
-            "texto": texto_debug,
-            "precoPor": preco_por,
-            "precoDe": preco_de,
-            "combo": promos_unicas[0] if promos_unicas else None,
-            "promocoes": promos_unicas,
+            "preco": preco_final,
+            "precoPor": None,
+            "precoDe": None,
+            "oferta": None,
         }
 
-    def pick_product_from_api(self, products, ean):
-        if not isinstance(products, list):
-            return None
-
-        for product in products:
-            for item in product.get("items", []) or []:
-                eans = [
-                    self.sanitize_ean(item.get("ean")),
-                    self.sanitize_ean(product.get("productReference")),
-                    self.sanitize_ean(product.get("productReferenceCode")),
-                ]
-                if ean in eans:
-                    return product
-
-        return products[0] if products else None
-
-    def extract_product_fields_from_api(self, product):
-        if not product:
-            return {}
-
-        item0 = (product.get("items") or [{}])[0]
-        offer = self.get_offer(product)
-
-        link = (
-            product.get("link")
-            or product.get("linkText")
-            or product.get("detailUrl")
+    def apply_price_rules(self, item):
+        normalized = self.normalize_prices(
+            preco=item.get("preco"),
+            preco_por=item.get("precoPor"),
+            preco_de=item.get("precoDe"),
         )
-        if link and not str(link).startswith("http"):
-            if not str(link).startswith("/"):
-                link = "/" + str(link)
-            link = self.abs_url(link)
-
-        out = {
-            "nome": self.normalize_text(product.get("productName") or product.get("name")),
-            "marca": self.normalize_text(product.get("brand")),
-            "sku": item0.get("itemId"),
-            "link": link,
-            "price_raw": offer.get("Price") or offer.get("spotPrice"),
-            "list_price_raw": offer.get("ListPrice"),
-            "price_without_discount_raw": offer.get("PriceWithoutDiscount") or offer.get("priceWithoutDiscount"),
-        }
-        return out
-
-    def normalize_prices(self, item):
-        preco = self.parse_price(item.get("preco") or item.get("precoPor"))
-        preco_por = self.parse_price(item.get("precoPor") or item.get("preco"))
-        preco_de = self.parse_price(item.get("precoDe"))
-
-        if item.get("indisponivel") == 1:
-            item["preco"] = 0.0
-            item["precoPor"] = 0.0
-            item["precoDe"] = 0.0
-            item["oferta"] = None
-            item["desconto_percentual"] = None
-            return item
-
-        promo_tipo = item.get("promo_tipo")
-        promo_texto = item.get("promo_texto")
-        promo_preco_unitario = self.parse_price(item.get("promo_preco_unitario"))
-        promo_preco_total = self.parse_price(item.get("promo_preco_total"))
-
-        if preco is None and preco_por is not None:
-            preco = preco_por
-        if preco_por is None and preco is not None:
-            preco_por = preco
-
-        if preco_de is not None and preco_por is not None and preco_de <= preco_por:
-            preco_de = None
-
-        oferta = None
-        desconto_percentual = None
-
-        if preco_de is not None and preco_por is not None and preco_de > preco_por:
-            oferta = "x"
-            try:
-                desconto_percentual = round((1 - (preco_por / preco_de)) * 100, 2)
-            except Exception:
-                desconto_percentual = None
-
-        item["preco"] = preco
-        item["precoPor"] = preco_por
-        item["precoDe"] = preco_de
-        item["oferta"] = oferta
-        item["desconto_percentual"] = desconto_percentual
-
-        item["promo_tipo"] = promo_tipo
-        item["promo_texto"] = promo_texto
-        item["promo_preco_unitario"] = promo_preco_unitario
-        item["promo_preco_total"] = promo_preco_total
-
+        item.update(normalized)
         return item
 
-    # ---------------- parse api ----------------
+    def extract_items_from_api_product(self, produto, ean, response):
+        product_name = (
+            produto.get("productName")
+            or produto.get("productTitle")
+            or produto.get("name")
+        )
 
-    def parse_api(self, response):
-        ean = response.meta["ean"]
+        brand = produto.get("brand")
+        link = produto.get("link") or produto.get("url")
+        if link and link.startswith("/"):
+            link = response.urljoin(link)
+
+        preco = None
+        preco_por = None
+        preco_de = None
+        sku_ean = None
+
+        items = produto.get("items") or []
+        item_match = None
+
+        for item in items:
+            item_ean = self.sanitize_ean(item.get("ean"))
+            ref_ids = item.get("referenceId") or []
+            ref_texto = " ".join(str(x.get("Value") or "") for x in ref_ids if isinstance(x, dict))
+
+            if item_ean == ean or ean in self.sanitize_ean(ref_texto):
+                item_match = item
+                sku_ean = item_ean or ean
+                break
+
+        if item_match is None and items:
+            item_match = items[0]
+            sku_ean = self.sanitize_ean(item_match.get("ean")) or ean
+
+        if item_match:
+            sellers = item_match.get("sellers") or []
+            seller = self.pick_best_seller(sellers)
+            if seller:
+                offer = seller.get("commertialOffer") or {}
+
+                preco_por = (
+                    offer.get("Price")
+                    or offer.get("spotPrice")
+                )
+
+                preco_de = (
+                    offer.get("PriceWithoutDiscount")
+                    or offer.get("ListPrice")
+                )
+
+                preco = preco_por or preco_de
+
+            item_link = item_match.get("detailUrl")
+            if item_link and item_link.startswith("/"):
+                item_link = response.urljoin(item_link)
+
+            if item_link:
+                link = item_link
+
+        item = {
+            "ean": ean,
+            "nome": self.clean_nome(product_name, ean),
+            "marca": self.normalize_text(brand),
+            "preco": preco,
+            "precoPor": preco_por,
+            "precoDe": preco_de,
+            "oferta": None,
+            "loja": "carrefour_ar",
+            "link": link,
+            "sku_ean_encontrado": sku_ean,
+        }
+        return self.apply_price_rules(item)
+
+    # ---------------- start ----------------
+
+    async def start(self):
+        if self.ean:
+            eans_brutos = [self.ean]
+        else:
+            eans_brutos = self.ler_eans_arquivo(self.arquivo_entrada)
+
+        for ean_bruto in eans_brutos:
+            ean = self.sanitize_ean(ean_bruto)
+
+            if not self.ean_valido(ean):
+                self.logger.warning(
+                    "EAN inválido ignorado | original=%s | sanitizado=%s",
+                    ean_bruto,
+                    ean,
+                )
+                yield {
+                    "ean": ean,
+                    "nome": None,
+                    "marca": None,
+                    "preco": None,
+                    "precoPor": None,
+                    "precoDe": None,
+                    "oferta": None,
+                    "loja": "carrefour_ar",
+                    "link": None,
+                }
+                continue
+
+            api_url = self.build_api_ean_url(ean)
+
+            self.logger.info("API EAN | valor=%s | URL=%s", ean, api_url)
+
+            yield Request(
+                url=api_url,
+                callback=self.parse_api_ean,
+                dont_filter=True,
+                meta={"ean_atual": ean},
+                headers={"Accept": "application/json, text/plain, */*"},
+            )
+
+    # ---------------- tentativa 1 ----------------
+
+    def parse_api_ean(self, response):
+        ean = response.meta["ean_atual"]
+
+        self.logger.info("API EAN RESPONSE | STATUS=%s | URL=%s", response.status, response.url)
 
         try:
             data = json.loads(response.text)
         except Exception:
             data = None
 
-        product = self.pick_product_from_api(data, ean) if data else None
+        if isinstance(data, list) and data:
+            self.logger.info("API EAN RESPONSE | produtos=%d", len(data))
+            item = self.extract_items_from_api_product(data[0], ean, response)
 
-        if not product:
-            ft_url = self.build_api_ft_url(ean)
-            yield Request(
-                ft_url,
-                callback=self.parse_api_ft,
-                meta={"ean": ean},
-                dont_filter=True,
+            self.logger.info(
+                "API EAN FINAL | EAN=%s | nome=%s | preco=%s | precoPor=%s | precoDe=%s | oferta=%s | link=%s",
+                item["ean"], item["nome"], item["preco"], item["precoPor"], item["precoDe"], item["oferta"], item["link"]
             )
+
+            if item["link"] and self.is_pdp_url(item["link"]):
+                yield Request(
+                    url=item["link"],
+                    callback=self.parse_produto,
+                    dont_filter=True,
+                    meta={
+                        "ean_atual": ean,
+                        "item_base": item,
+                        "playwright": True,
+                        "playwright_include_page": True,
+                        "playwright_page_methods": [
+                            PageMethod("wait_for_load_state", "networkidle"),
+                            PageMethod("wait_for_timeout", 1500),
+                        ] if PageMethod else [],
+                    },
+                )
+                return
+
+            item.pop("sku_ean_encontrado", None)
+            yield self.apply_price_rules(item)
             return
 
-        base = self.extract_product_fields_from_api(product)
+        self.logger.warning("API EAN sem resultados para EAN=%s", ean)
 
-        item = {
-            "loja": "Carrefour",
-            "ean": ean,
-            "sku": base.get("sku"),
-            "nome": base.get("nome"),
-            "marca": base.get("marca"),
-            "preco": base.get("price_raw"),
-            "precoPor": base.get("price_raw"),
-            "precoDe": base.get("list_price_raw") or base.get("price_without_discount_raw"),
-            "oferta": None,
-            "desconto_percentual": None,
-            "promo_tipo": None,
-            "promo_texto": None,
-            "promo_preco_unitario": None,
-            "promo_preco_total": None,
-            "promo_mecanica": None,
-            "promo_percentual": None,
-            "promo_qtd_leva": None,
-            "promo_qtd_paga": None,
-            "promo_qtd_compra": None,
-            "promo_quantidade_minima": None,
-            "promocoes_detectadas": None,
-            "price_raw": base.get("price_raw"),
-            "list_price_raw": base.get("list_price_raw"),
-            "price_without_discount_raw": base.get("price_without_discount_raw"),
-            "link": base.get("link"),
-            "indisponivel": 0,
-        }
+        api_ft_url = self.build_api_ft_url(ean)
+        self.logger.info("API FT | valor=%s | URL=%s", ean, api_ft_url)
 
-        item = self.normalize_prices(item)
+        yield Request(
+            url=api_ft_url,
+            callback=self.parse_api_ft,
+            dont_filter=True,
+            meta={"ean_atual": ean},
+            headers={"Accept": "application/json, text/plain, */*"},
+        )
 
-        pdp_url = item.get("link") or self.build_search_url(ean)
+    # ---------------- tentativa 2 ----------------
 
-        if self.usar_playwright and PageMethod is not None:
+    def parse_api_ft(self, response):
+        ean = response.meta["ean_atual"]
+
+        self.logger.info("API FT RESPONSE | STATUS=%s | URL=%s", response.status, response.url)
+
+        try:
+            data = json.loads(response.text)
+        except Exception:
+            data = None
+
+        if isinstance(data, list) and data:
+            self.logger.info("API FT RESPONSE | produtos=%d", len(data))
+
+            melhor = None
+
+            for produto in data:
+                extraido = self.extract_items_from_api_product(produto, ean, response)
+
+                nome = extraido.get("nome") or ""
+                sku_ean = str(extraido.get("sku_ean_encontrado") or "").strip()
+                score = 0
+
+                if sku_ean == ean:
+                    score += 1000
+                if extraido.get("preco") is not None:
+                    score += 200
+                if extraido.get("nome"):
+                    score += 50
+                if extraido.get("link") and self.is_pdp_url(extraido.get("link")):
+                    score += 100
+                if nome and not self.texto_ruim(nome):
+                    score += 20
+
+                extraido["_score"] = score
+
+                if melhor is None or extraido["_score"] > melhor["_score"]:
+                    melhor = extraido
+
+            if melhor:
+                self.logger.info(
+                    "API FT FINAL | EAN=%s | nome=%s | preco=%s | precoPor=%s | precoDe=%s | oferta=%s | link=%s",
+                    melhor["ean"], melhor["nome"], melhor["preco"], melhor["precoPor"], melhor["precoDe"], melhor["oferta"], melhor["link"]
+                )
+
+                melhor.pop("_score", None)
+                melhor.pop("sku_ean_encontrado", None)
+
+                if melhor["link"] and self.is_pdp_url(melhor["link"]):
+                    yield Request(
+                        url=melhor["link"],
+                        callback=self.parse_produto,
+                        dont_filter=True,
+                        meta={
+                            "ean_atual": ean,
+                            "item_base": melhor,
+                            "playwright": True,
+                            "playwright_include_page": True,
+                            "playwright_page_methods": [
+                                PageMethod("wait_for_load_state", "networkidle"),
+                                PageMethod("wait_for_timeout", 1500),
+                            ] if PageMethod else [],
+                        },
+                    )
+                    return
+
+                yield self.apply_price_rules(melhor)
+                return
+
+        self.logger.warning("API FT sem resultados para EAN=%s", ean)
+
+        search_url = self.build_search_url(ean)
+        self.logger.info("HTML BUSCA | valor=%s | URL=%s", ean, search_url)
+
+        yield Request(
+            url=search_url,
+            callback=self.parse_busca_html,
+            dont_filter=True,
+            meta={"ean_atual": ean},
+        )
+
+    # ---------------- tentativa 3 ----------------
+
+    def parse_busca_html(self, response):
+        ean = response.meta["ean_atual"]
+
+        self.logger.info("HTML RESPONSE | STATUS=%s | URL=%s", response.status, response.url)
+
+        links = response.css('a[href*="/p"]::attr(href)').getall()
+        links_validos = []
+
+        for href in links:
+            href_abs = response.urljoin(href)
+
+            if "/promociones" in href_abs:
+                continue
+
+            if href_abs not in links_validos:
+                links_validos.append(href_abs)
+
+        self.logger.info("HTML BUSCA | links_pdp_validos=%d", len(links_validos))
+
+        if links_validos:
             yield Request(
-                pdp_url,
-                callback=self.parse_pdp_playwright,
+                url=links_validos[0],
+                callback=self.parse_produto,
+                dont_filter=True,
                 meta={
-                    "ean": ean,
-                    "item_base": item,
+                    "ean_atual": ean,
+                    "item_base": {
+                        "ean": ean,
+                        "nome": None,
+                        "marca": None,
+                        "preco": None,
+                        "precoPor": None,
+                        "precoDe": None,
+                        "oferta": None,
+                        "loja": "carrefour_ar",
+                        "link": links_validos[0],
+                    },
                     "playwright": True,
                     "playwright_include_page": True,
                     "playwright_page_methods": [
                         PageMethod("wait_for_load_state", "networkidle"),
-                    ],
+                        PageMethod("wait_for_timeout", 1500),
+                    ] if PageMethod else [],
                 },
-                errback=self.errback_close_page,
-                dont_filter=True,
             )
-        else:
-            yield Request(
-                pdp_url,
-                callback=self.parse_pdp,
-                meta={"ean": ean, "item_base": item},
-                dont_filter=True,
-            )
+            return
 
-    def parse_api_ft(self, response):
-        ean = response.meta["ean"]
+        self.logger.warning(
+            "Busca sem PDP no HTML cru. Vou renderizar categoria e procurar EAN=%s dentro dela | URL=%s",
+            ean,
+            response.url,
+        )
 
-        try:
-            data = json.loads(response.text)
-        except Exception:
-            data = None
+        yield Request(
+            url=response.url,
+            callback=self.parse_categoria_playwright,
+            dont_filter=True,
+            meta={
+                "ean_atual": ean,
+                "playwright": True,
+                "playwright_include_page": True,
+                "playwright_page_methods": [
+                    PageMethod("wait_for_load_state", "domcontentloaded"),
+                    PageMethod("wait_for_timeout", 3000),
+                    PageMethod("evaluate", "window.scrollTo(0, document.body.scrollHeight)"),
+                    PageMethod("wait_for_timeout", 2000),
+                ] if PageMethod else [],
+            },
+        )
 
-        product = self.pick_product_from_api(data, ean) if data else None
+    # ---------------- categoria renderizada ----------------
 
-        if not product:
+    async def parse_categoria_playwright(self, response):
+        ean = response.meta["ean_atual"]
+        page = response.meta.get("playwright_page")
+
+        if page is None:
+            self.logger.warning("Playwright page não veio no response para EAN=%s", ean)
             yield {
-                "loja": "Carrefour",
                 "ean": ean,
-                "sku": None,
                 "nome": None,
                 "marca": None,
                 "preco": None,
                 "precoPor": None,
                 "precoDe": None,
                 "oferta": None,
-                "desconto_percentual": None,
-                "promo_tipo": None,
-                "promo_texto": None,
-                "promo_preco_unitario": None,
-                "promo_preco_total": None,
-                "promo_mecanica": None,
-                "promo_percentual": None,
-                "promo_qtd_leva": None,
-                "promo_qtd_paga": None,
-                "promo_qtd_compra": None,
-                "promo_quantidade_minima": None,
-                "promocoes_detectadas": None,
-                "price_raw": None,
-                "list_price_raw": None,
-                "price_without_discount_raw": None,
-                "link": self.build_search_url(ean),
-                "indisponivel": 0,
+                "loja": "carrefour_ar",
+                "link": response.url,
             }
             return
 
-        base = self.extract_product_fields_from_api(product)
+        try:
+            produto_info = await page.evaluate(
+                """(ean) => {
+                    const normalizar = (txt) => (txt || '').replace(/\\s+/g, ' ').trim();
+                    const soDigitos = (txt) => (txt || '').replace(/\\D/g, '');
+
+                    const candidatos = Array.from(document.querySelectorAll('a, article, section, div, li'));
+                    const encontrados = [];
+
+                    for (const el of candidatos) {
+                        const texto = normalizar(el.textContent || '');
+                        if (!texto) continue;
+
+                        const hrefEl = el.matches('a[href*="/p"]') ? el : el.querySelector('a[href*="/p"]');
+                        const href = hrefEl ? hrefEl.href : null;
+
+                        const datasetStr = JSON.stringify(el.dataset || {});
+                        const html = el.outerHTML || '';
+
+                        const bateEan =
+                            soDigitos(texto).includes(ean) ||
+                            soDigitos(datasetStr).includes(ean) ||
+                            soDigitos(html).includes(ean);
+
+                        if (!bateEan) continue;
+
+                        const nomeEl =
+                            el.querySelector('h1, h2, h3, h4') ||
+                            el.querySelector('[class*="name"]') ||
+                            el.querySelector('[class*="productName"]') ||
+                            el.querySelector('[class*="product-name"]') ||
+                            el.querySelector('span');
+
+                        const precoEl =
+                            el.querySelector('.valtech-carrefourar-product-price-0-x-sellingPriceValue .valtech-carrefourar-product-price-0-x-currencyContainer') ||
+                            el.querySelector('.valtech-carrefourar-product-price-0-x-currencyContainer') ||
+                            el.querySelector('[class*="price"]') ||
+                            el.querySelector('[data-testid*="price"]');
+
+                        encontrados.push({
+                            nome: normalizar(nomeEl ? nomeEl.textContent : texto.slice(0, 180)),
+                            preco: normalizar(precoEl ? precoEl.textContent : null),
+                            link: href,
+                            texto: texto.slice(0, 500),
+                        });
+                    }
+
+                    const comPdp = encontrados.filter(x => x.link && x.link.includes('/p'));
+                    if (comPdp.length) return comPdp[0];
+                    if (encontrados.length) return encontrados[0];
+                    return null;
+                }""",
+                ean,
+            )
+        except Exception as exc:
+            self.logger.warning("Falha no evaluate da categoria | EAN=%s | erro=%s", ean, exc)
+            produto_info = None
+
+        await page.close()
+
+        if not produto_info:
+            self.logger.warning(
+                "Não encontrei o EAN dentro da categoria renderizada | EAN=%s | URL=%s",
+                ean,
+                response.url,
+            )
+            yield {
+                "ean": ean,
+                "nome": None,
+                "marca": None,
+                "preco": None,
+                "precoPor": None,
+                "precoDe": None,
+                "oferta": None,
+                "loja": "carrefour_ar",
+                "link": response.url,
+            }
+            return
+
+        link = produto_info.get("link")
+        nome = self.clean_nome(produto_info.get("nome"), ean)
+        preco = self.parse_price(produto_info.get("preco"))
+
+        self.logger.info(
+            "CATEGORIA PLAYWRIGHT | EAN=%s | nome=%s | preco=%s | link=%s",
+            ean, nome, preco, link
+        )
+
+        if link and self.is_pdp_url(link):
+            yield Request(
+                url=link,
+                callback=self.parse_produto,
+                dont_filter=True,
+                meta={
+                    "ean_atual": ean,
+                    "item_base": {
+                        "ean": ean,
+                        "nome": nome,
+                        "marca": None,
+                        "preco": preco,
+                        "precoPor": None,
+                        "precoDe": None,
+                        "oferta": None,
+                        "loja": "carrefour_ar",
+                        "link": link,
+                    },
+                    "playwright": True,
+                    "playwright_include_page": True,
+                    "playwright_page_methods": [
+                        PageMethod("wait_for_load_state", "networkidle"),
+                        PageMethod("wait_for_timeout", 2000),
+                    ] if PageMethod else [],
+                },
+            )
+            return
 
         item = {
-            "loja": "Carrefour",
             "ean": ean,
-            "sku": base.get("sku"),
-            "nome": base.get("nome"),
-            "marca": base.get("marca"),
-            "preco": base.get("price_raw"),
-            "precoPor": base.get("price_raw"),
-            "precoDe": base.get("list_price_raw") or base.get("price_without_discount_raw"),
+            "nome": nome,
+            "marca": None,
+            "preco": preco,
+            "precoPor": None,
+            "precoDe": None,
             "oferta": None,
-            "desconto_percentual": None,
-            "promo_tipo": None,
-            "promo_texto": None,
-            "promo_preco_unitario": None,
-            "promo_preco_total": None,
-            "promo_mecanica": None,
-            "promo_percentual": None,
-            "promo_qtd_leva": None,
-            "promo_qtd_paga": None,
-            "promo_qtd_compra": None,
-            "promo_quantidade_minima": None,
-            "promocoes_detectadas": None,
-            "price_raw": base.get("price_raw"),
-            "list_price_raw": base.get("list_price_raw"),
-            "price_without_discount_raw": base.get("price_without_discount_raw"),
-            "link": base.get("link"),
-            "indisponivel": 0,
+            "loja": "carrefour_ar",
+            "link": link or response.url,
         }
+        yield self.apply_price_rules(item)
 
-        item = self.normalize_prices(item)
+    # ---------------- PDP ----------------
 
-        pdp_url = item.get("link") or self.build_search_url(ean)
-
-        yield Request(
-            pdp_url,
-            callback=self.parse_pdp,
-            meta={"ean": ean, "item_base": item},
-            dont_filter=True,
-        )
-
-    # ---------------- parse pdp ----------------
-
-    def merge_structured_price_sources(self, response, item):
-        candidatos = []
-
-        for bloco in self.extract_json_ld_blocks(response):
-            candidatos.extend(self.walk_prices(bloco, path="jsonld"))
-
-            offer = self.find_offer_in_jsonld(bloco)
-            if offer:
-                p = self.parse_price(offer.get("price"))
-                if p is not None:
-                    candidatos.append({"tipo": "precoPor", "valor": p, "path": "jsonld.offer.price"})
-
-                ps = offer.get("priceSpecification")
-                if isinstance(ps, dict):
-                    lp = self.parse_price(ps.get("price"))
-                    price_type = str(ps.get("priceType") or "")
-                    if lp is not None and "StrikethroughPrice" in price_type:
-                        candidatos.append({"tipo": "precoDe", "valor": lp, "path": "jsonld.offer.priceSpecification"})
-                elif isinstance(ps, list):
-                    for i, spec in enumerate(ps):
-                        if not isinstance(spec, dict):
-                            continue
-                        lp = self.parse_price(spec.get("price"))
-                        price_type = str(spec.get("priceType") or "")
-                        if lp is not None and "StrikethroughPrice" in price_type:
-                            candidatos.append({"tipo": "precoDe", "valor": lp, "path": f"jsonld.offer.priceSpecification[{i}]"})
-
-        for emb in self.extract_embedded_json_objects(response):
-            candidatos.extend(self.walk_prices(emb, path="embedded"))
-
-        preco_por = item.get("precoPor")
-        preco_de = item.get("precoDe")
-
-        for c in candidatos:
-            if c["tipo"] == "precoPor" and preco_por is None:
-                preco_por = c["valor"]
-
-        lista_preco_de = [c["valor"] for c in candidatos if c["tipo"] == "precoDe"]
-        lista_preco_por = [c["valor"] for c in candidatos if c["tipo"] == "precoPor"]
-
-        if preco_por is None and lista_preco_por:
-            preco_por = min(lista_preco_por)
-
-        if lista_preco_de:
-            cand = max(lista_preco_de)
-            if preco_por is None or cand > preco_por:
-                preco_de = cand
-
-        item["preco"] = preco_por if preco_por is not None else item.get("preco")
-        item["precoPor"] = preco_por
-        item["precoDe"] = preco_de
-        item["debug_candidatos_estruturados"] = candidatos[:50] or None
-        return item
-
-    def merge_pdp_data(self, response, item):
-        texto_pagina = " ".join(
-            response.css("h1 *::text, section *::text, article *::text, [class*='product'] *::text").getall()
-        )
-        texto_pagina = re.sub(r"\s+", " ", texto_pagina).strip()
-
-        if self.is_unavailable_text(texto_pagina):
-            item["link"] = response.url
-            item["debug_texto_preco"] = texto_pagina[:700] if texto_pagina else None
-            return self.mark_unavailable(item)
-
-        item = self.merge_structured_price_sources(response, item)
-
-        dom = self.extract_prices_from_dom(response)
-        texto_dom = dom.get("texto")
-        promocoes = dom.get("promocoes") or []
-
-        dom_preco_por = self.parse_price(dom.get("precoPor"))
-        dom_preco_de = self.parse_price(dom.get("precoDe"))
-
-        if item.get("precoPor") is None and dom_preco_por is not None:
-            item["preco"] = dom_preco_por
-            item["precoPor"] = dom_preco_por
-
-        if item.get("precoDe") is None and dom_preco_de is not None:
-            item["precoDe"] = dom_preco_de
-
-        if promocoes:
-            item["promocoes_detectadas"] = promocoes
-            principal = promocoes[0]
-
-            item["promo_tipo"] = principal.get("tipo")
-            item["promo_texto"] = principal.get("texto_contexto") or principal.get("match")
-            item["promo_preco_unitario"] = principal.get("preco_unitario")
-            item["promo_preco_total"] = principal.get("preco_total")
-            item["promo_mecanica"] = principal.get("mecanica")
-            item["promo_percentual"] = principal.get("percentual")
-            item["promo_qtd_leva"] = principal.get("qtd_leva")
-            item["promo_qtd_paga"] = principal.get("qtd_paga")
-            item["promo_qtd_compra"] = principal.get("qtd_compra")
-            item["promo_quantidade_minima"] = principal.get("quantidade_minima")
-
-        if not item.get("nome"):
-            nome = response.css("h1 *::text").getall()
-            if nome:
-                item["nome"] = self.normalize_text(" ".join(nome))
-
-        item["link"] = response.url
-        item["debug_texto_preco"] = texto_dom[:700] if texto_dom else None
-
-        return self.normalize_prices(item)
-
-    def parse_pdp(self, response):
-        item = dict(response.meta["item_base"])
-        item = self.merge_pdp_data(response, item)
-        yield item
-
-    async def parse_pdp_playwright(self, response):
-        item = dict(response.meta["item_base"])
+    async def parse_produto(self, response):
+        ean = response.meta["ean_atual"]
+        base = response.meta.get("item_base") or {}
         page = response.meta.get("playwright_page")
 
-        try:
-            item = self.merge_pdp_data(response, item)
-            yield item
-        finally:
+        if "/promociones" in response.url:
+            self.logger.warning("URL de promo genérica ignorada | EAN=%s | URL=%s", ean, response.url)
             if page:
                 await page.close()
+            item = {
+                "ean": ean,
+                "nome": base.get("nome"),
+                "marca": base.get("marca"),
+                "preco": base.get("preco"),
+                "precoPor": None,
+                "precoDe": None,
+                "oferta": None,
+                "loja": "carrefour_ar",
+                "link": response.url,
+            }
+            yield self.apply_price_rules(item)
+            return
 
-    async def errback_close_page(self, failure):
-        page = failure.request.meta.get("playwright_page")
+        nome = (
+            response.css("h1::text").get()
+            or response.css('[class*="productName"]::text').get()
+            or response.css("title::text").get()
+            or base.get("nome")
+        )
+        nome = self.clean_nome(nome, ean) or base.get("nome")
+
+        marca = (
+            response.css('[class*="productBrand"]::text').get()
+            or response.css('[class*="brand"]::text').get()
+            or base.get("marca")
+        )
+        marca = self.normalize_text(marca)
+
+        preco = base.get("preco")
+        preco_por = base.get("precoPor")
+        preco_de = base.get("precoDe")
+
+        partes_preco_por = response.css(
+            ".valtech-carrefourar-product-price-0-x-sellingPriceValue "
+            ".valtech-carrefourar-product-price-0-x-currencyContainer *::text"
+        ).getall()
+        texto_preco_por = "".join(p.strip() for p in partes_preco_por if p.strip()) or None
+
+        if texto_preco_por:
+            preco_por = self.parse_price(texto_preco_por)
+
+        partes_preco_de = response.css(
+            ".valtech-carrefourar-product-price-0-x-listPriceValue "
+            ".valtech-carrefourar-product-price-0-x-currencyContainer *::text"
+        ).getall()
+        texto_preco_de = "".join(p.strip() for p in partes_preco_de if p.strip()) or None
+
+        if texto_preco_de:
+            preco_de = self.parse_price(texto_preco_de)
+
+        if preco_de is None:
+            possiveis_seletores_preco_de = [
+                '.valtech-carrefourar-product-price-0-x-listPriceValue *::text',
+                '.valtech-carrefourar-product-price-0-x-listPrice *::text',
+                '[class*="listPrice"] *::text',
+                '[class*="list-price"] *::text',
+                '[class*="strike"] *::text',
+                'span[style*="line-through"]::text',
+            ]
+            for seletor in possiveis_seletores_preco_de:
+                partes = response.css(seletor).getall()
+                txt = "".join(p.strip() for p in partes if p.strip()) or None
+                if txt:
+                    preco_de = self.parse_price(txt)
+                    if preco_de is not None:
+                        break
+
+        if page and (preco_por is None or preco_de is None):
+            try:
+                precos_js = await page.evaluate(
+                    """() => {
+                        const normalizar = (txt) => (txt || '').replace(/\\s+/g, ' ').trim();
+
+                        const pegarTexto = (seletores) => {
+                            for (const s of seletores) {
+                                const el = document.querySelector(s);
+                                if (el && el.textContent && el.textContent.trim()) {
+                                    return normalizar(el.textContent);
+                                }
+                            }
+                            return null;
+                        };
+
+                        const precoPor = pegarTexto([
+                            '.valtech-carrefourar-product-price-0-x-sellingPriceValue .valtech-carrefourar-product-price-0-x-currencyContainer',
+                            '.valtech-carrefourar-product-price-0-x-sellingPriceValue',
+                            '.valtech-carrefourar-product-price-0-x-sellingPrice',
+                            '[class*="sellingPrice"]',
+                            '[class*="spotPrice"]'
+                        ]);
+
+                        const precoDe = pegarTexto([
+                            '.valtech-carrefourar-product-price-0-x-listPriceValue .valtech-carrefourar-product-price-0-x-currencyContainer',
+                            '.valtech-carrefourar-product-price-0-x-listPriceValue',
+                            '.valtech-carrefourar-product-price-0-x-listPrice',
+                            '[class*="listPrice"]',
+                            '[class*="list-price"]',
+                            '[class*="strike"]',
+                            'span[style*="line-through"]'
+                        ]);
+
+                        return { precoPor, precoDe };
+                    }"""
+                )
+
+                if precos_js:
+                    if preco_por is None and precos_js.get("precoPor"):
+                        preco_por = self.parse_price(precos_js.get("precoPor"))
+                    if preco_de is None and precos_js.get("precoDe"):
+                        preco_de = self.parse_price(precos_js.get("precoDe"))
+            except Exception as exc:
+                self.logger.warning("Falha ao ler preços via Playwright | EAN=%s | erro=%s", ean, exc)
+
+        if preco is None:
+            preco = preco_por or preco_de or base.get("preco")
+
+        if (preco_por is None or preco_de is None):
+            for bloco in response.css('script[type="application/ld+json"]::text').getall():
+                try:
+                    data = json.loads(bloco)
+                except Exception:
+                    continue
+
+                estruturas = data if isinstance(data, list) else [data]
+
+                for obj in estruturas:
+                    if not isinstance(obj, dict):
+                        continue
+
+                    if not nome:
+                        nome = self.clean_nome(obj.get("name"), ean) or nome
+
+                    brand = obj.get("brand")
+                    if isinstance(brand, dict):
+                        brand = brand.get("name")
+                    if not marca:
+                        marca = self.normalize_text(brand)
+
+                    offers = obj.get("offers") or {}
+                    if isinstance(offers, list):
+                        offers = offers[0] if offers else {}
+
+                    preco_json = (
+                        obj.get("price")
+                        or offers.get("price")
+                        or offers.get("lowPrice")
+                        or offers.get("highPrice")
+                    )
+
+                    list_price_json = None
+                    if isinstance(offers, dict):
+                        price_spec = offers.get("priceSpecification")
+                        if isinstance(price_spec, dict):
+                            list_price_json = price_spec.get("price")
+                        else:
+                            list_price_json = offers.get("listPrice")
+
+                    if preco_por is None and preco_json is not None:
+                        preco_por = self.parse_price(preco_json)
+
+                    if preco_de is None and list_price_json is not None:
+                        preco_de = self.parse_price(list_price_json)
+
+                    break
+
+                if preco_por is not None or preco_de is not None:
+                    break
+
         if page:
             await page.close()
+
+        item = {
+            "ean": ean,
+            "nome": nome,
+            "marca": marca,
+            "preco": preco,
+            "precoPor": preco_por,
+            "precoDe": preco_de,
+            "oferta": None,
+            "loja": "carrefour_ar",
+            "link": response.url,
+        }
+
+        item = self.apply_price_rules(item)
+
+        self.logger.info(
+            "PDP FINAL | EAN=%s | nome=%s | preco=%s | precoPor=%s | precoDe=%s | oferta=%s | link=%s",
+            item["ean"], item["nome"], item["preco"], item["precoPor"], item["precoDe"], item["oferta"], item["link"]
+        )
+
+        yield item
