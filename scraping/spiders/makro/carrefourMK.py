@@ -248,14 +248,49 @@ class CarrefourMRSpider(scrapy.Spider):
 
         return nome_limpo
 
+    def seller_em_estoque(self, seller):
+        if not seller:
+            return False
+
+        offer = seller.get("commertialOffer") or {}
+
+        available_qty = (
+            offer.get("AvailableQuantity")
+            if offer.get("AvailableQuantity") is not None
+            else offer.get("availableQuantity")
+        )
+        is_available = (
+            offer.get("IsAvailable")
+            if offer.get("IsAvailable") is not None
+            else offer.get("isAvailable")
+        )
+
+        if available_qty is not None:
+            try:
+                return float(available_qty) > 0
+            except Exception:
+                pass
+
+        if is_available is not None:
+            if isinstance(is_available, str):
+                return is_available.strip().lower() in ("true", "1", "sim", "yes")
+            return bool(is_available)
+
+        return False
+
     def pick_best_seller(self, sellers):
         if not sellers:
+            return None
+
+        sellers_disponiveis = [s for s in sellers if self.seller_em_estoque(s)]
+
+        if not sellers_disponiveis:
             return None
 
         melhor = None
         melhor_preco = None
 
-        for seller in sellers:
+        for seller in sellers_disponiveis:
             offer = seller.get("commertialOffer") or {}
 
             preco = (
@@ -272,7 +307,7 @@ class CarrefourMRSpider(scrapy.Spider):
                 melhor = seller
                 melhor_preco = preco
 
-        return melhor or sellers[0]
+        return melhor or sellers_disponiveis[0]
 
     def build_search_url(self, ean):
         return f"https://www.carrefour.com.ar/{quote(ean)}?_q={quote(ean)}&map=ft"
@@ -322,6 +357,14 @@ class CarrefourMRSpider(scrapy.Spider):
         item.update(normalized)
         return item
 
+    def item_sem_estoque(self, item):
+        item["preco"] = None
+        item["precoPor"] = None
+        item["precoDe"] = None
+        item["oferta"] = None
+        item["em_estoque"] = False
+        return item
+
     def extract_items_from_api_product(self, produto, ean, response):
         product_name = (
             produto.get("productName")
@@ -338,6 +381,7 @@ class CarrefourMRSpider(scrapy.Spider):
         preco_por = None
         preco_de = None
         sku_ean = None
+        em_estoque = False
 
         items = produto.get("items") or []
         item_match = None
@@ -359,7 +403,9 @@ class CarrefourMRSpider(scrapy.Spider):
         if item_match:
             sellers = item_match.get("sellers") or []
             seller = self.pick_best_seller(sellers)
+
             if seller:
+                em_estoque = True
                 offer = seller.get("commertialOffer") or {}
 
                 preco_por = (
@@ -392,7 +438,12 @@ class CarrefourMRSpider(scrapy.Spider):
             "loja": "carrefour_ar",
             "link": link,
             "sku_ean_encontrado": sku_ean,
+            "em_estoque": em_estoque,
         }
+
+        if not em_estoque:
+            return self.item_sem_estoque(item)
+
         return self.apply_price_rules(item)
 
     # ---------------- start ----------------
@@ -422,6 +473,7 @@ class CarrefourMRSpider(scrapy.Spider):
                     "oferta": None,
                     "loja": "carrefour_ar",
                     "link": None,
+                    "em_estoque": False,
                 }
                 continue
 
@@ -454,9 +506,14 @@ class CarrefourMRSpider(scrapy.Spider):
             item = self.extract_items_from_api_product(data[0], ean, response)
 
             self.logger.info(
-                "API EAN FINAL | EAN=%s | nome=%s | preco=%s | precoPor=%s | precoDe=%s | oferta=%s | link=%s",
-                item["ean"], item["nome"], item["preco"], item["precoPor"], item["precoDe"], item["oferta"], item["link"]
+                "API EAN FINAL | EAN=%s | nome=%s | preco=%s | precoPor=%s | precoDe=%s | oferta=%s | em_estoque=%s | link=%s",
+                item["ean"], item["nome"], item["preco"], item["precoPor"], item["precoDe"], item["oferta"], item.get("em_estoque"), item["link"]
             )
+
+            if not item.get("em_estoque"):
+                item.pop("sku_ean_encontrado", None)
+                yield item
+                return
 
             if item["link"] and self.is_pdp_url(item["link"]):
                 yield Request(
@@ -519,6 +576,8 @@ class CarrefourMRSpider(scrapy.Spider):
 
                 if sku_ean == ean:
                     score += 1000
+                if extraido.get("em_estoque"):
+                    score += 500
                 if extraido.get("preco") is not None:
                     score += 200
                 if extraido.get("nome"):
@@ -535,12 +594,16 @@ class CarrefourMRSpider(scrapy.Spider):
 
             if melhor:
                 self.logger.info(
-                    "API FT FINAL | EAN=%s | nome=%s | preco=%s | precoPor=%s | precoDe=%s | oferta=%s | link=%s",
-                    melhor["ean"], melhor["nome"], melhor["preco"], melhor["precoPor"], melhor["precoDe"], melhor["oferta"], melhor["link"]
+                    "API FT FINAL | EAN=%s | nome=%s | preco=%s | precoPor=%s | precoDe=%s | oferta=%s | em_estoque=%s | link=%s",
+                    melhor["ean"], melhor["nome"], melhor["preco"], melhor["precoPor"], melhor["precoDe"], melhor["oferta"], melhor.get("em_estoque"), melhor["link"]
                 )
 
                 melhor.pop("_score", None)
                 melhor.pop("sku_ean_encontrado", None)
+
+                if not melhor.get("em_estoque"):
+                    yield melhor
+                    return
 
                 if melhor["link"] and self.is_pdp_url(melhor["link"]):
                     yield Request(
@@ -613,6 +676,7 @@ class CarrefourMRSpider(scrapy.Spider):
                         "oferta": None,
                         "loja": "carrefour_ar",
                         "link": links_validos[0],
+                        "em_estoque": None,
                     },
                     "playwright": True,
                     "playwright_include_page": True,
@@ -665,6 +729,7 @@ class CarrefourMRSpider(scrapy.Spider):
                 "oferta": None,
                 "loja": "carrefour_ar",
                 "link": response.url,
+                "em_estoque": None,
             }
             return
 
@@ -744,6 +809,7 @@ class CarrefourMRSpider(scrapy.Spider):
                 "oferta": None,
                 "loja": "carrefour_ar",
                 "link": response.url,
+                "em_estoque": None,
             }
             return
 
@@ -773,6 +839,7 @@ class CarrefourMRSpider(scrapy.Spider):
                         "oferta": None,
                         "loja": "carrefour_ar",
                         "link": link,
+                        "em_estoque": None,
                     },
                     "playwright": True,
                     "playwright_include_page": True,
@@ -794,6 +861,7 @@ class CarrefourMRSpider(scrapy.Spider):
             "oferta": None,
             "loja": "carrefour_ar",
             "link": link or response.url,
+            "em_estoque": None,
         }
         yield self.apply_price_rules(item)
 
@@ -818,6 +886,7 @@ class CarrefourMRSpider(scrapy.Spider):
                 "oferta": None,
                 "loja": "carrefour_ar",
                 "link": response.url,
+                "em_estoque": base.get("em_estoque"),
             }
             yield self.apply_price_rules(item)
             return
@@ -840,6 +909,7 @@ class CarrefourMRSpider(scrapy.Spider):
         preco = base.get("preco")
         preco_por = base.get("precoPor")
         preco_de = base.get("precoDe")
+        em_estoque = base.get("em_estoque")
 
         partes_preco_por = response.css(
             ".valtech-carrefourar-product-price-0-x-sellingPriceValue "
@@ -876,9 +946,9 @@ class CarrefourMRSpider(scrapy.Spider):
                     if preco_de is not None:
                         break
 
-        if page and (preco_por is None or preco_de is None):
+        if page and (preco_por is None or preco_de is None or em_estoque is None):
             try:
-                precos_js = await page.evaluate(
+                dados_js = await page.evaluate(
                     """() => {
                         const normalizar = (txt) => (txt || '').replace(/\\s+/g, ' ').trim();
 
@@ -891,6 +961,11 @@ class CarrefourMRSpider(scrapy.Spider):
                             }
                             return null;
                         };
+
+                        const textoPagina = normalizar(document.body ? document.body.innerText : '');
+
+                        const indisponivel =
+                            /sin stock|agotado|no disponible|sin disponibilidad/i.test(textoPagina);
 
                         const precoPor = pegarTexto([
                             '.valtech-carrefourar-product-price-0-x-sellingPriceValue .valtech-carrefourar-product-price-0-x-currencyContainer',
@@ -910,17 +985,26 @@ class CarrefourMRSpider(scrapy.Spider):
                             'span[style*="line-through"]'
                         ]);
 
-                        return { precoPor, precoDe };
+                        const botaoIndisponivel =
+                            !!document.querySelector('button[disabled], [aria-disabled="true"]');
+
+                        return {
+                            precoPor,
+                            precoDe,
+                            emEstoque: indisponivel ? false : (botaoIndisponivel ? null : true)
+                        };
                     }"""
                 )
 
-                if precos_js:
-                    if preco_por is None and precos_js.get("precoPor"):
-                        preco_por = self.parse_price(precos_js.get("precoPor"))
-                    if preco_de is None and precos_js.get("precoDe"):
-                        preco_de = self.parse_price(precos_js.get("precoDe"))
+                if dados_js:
+                    if preco_por is None and dados_js.get("precoPor"):
+                        preco_por = self.parse_price(dados_js.get("precoPor"))
+                    if preco_de is None and dados_js.get("precoDe"):
+                        preco_de = self.parse_price(dados_js.get("precoDe"))
+                    if em_estoque is None:
+                        em_estoque = dados_js.get("emEstoque")
             except Exception as exc:
-                self.logger.warning("Falha ao ler preços via Playwright | EAN=%s | erro=%s", ean, exc)
+                self.logger.warning("Falha ao ler preços/estoque via Playwright | EAN=%s | erro=%s", ean, exc)
 
         if preco is None:
             preco = preco_por or preco_de or base.get("preco")
@@ -966,16 +1050,35 @@ class CarrefourMRSpider(scrapy.Spider):
                         else:
                             list_price_json = offers.get("listPrice")
 
+                    availability = None
+                    if isinstance(offers, dict):
+                        availability = offers.get("availability")
+
                     if preco_por is None and preco_json is not None:
                         preco_por = self.parse_price(preco_json)
 
                     if preco_de is None and list_price_json is not None:
                         preco_de = self.parse_price(list_price_json)
 
+                    if em_estoque is None and availability:
+                        availability_txt = str(availability).lower()
+                        if "instock" in availability_txt:
+                            em_estoque = True
+                        elif "outofstock" in availability_txt:
+                            em_estoque = False
+
                     break
 
-                if preco_por is not None or preco_de is not None:
+                if preco_por is not None or preco_de is not None or em_estoque is not None:
                     break
+
+        if em_estoque is None:
+            em_estoque = preco is not None or preco_por is not None
+
+        if not em_estoque:
+            preco = None
+            preco_por = None
+            preco_de = None
 
         if page:
             await page.close()
@@ -990,13 +1093,17 @@ class CarrefourMRSpider(scrapy.Spider):
             "oferta": None,
             "loja": "carrefour_ar",
             "link": response.url,
+            "em_estoque": em_estoque,
         }
 
-        item = self.apply_price_rules(item)
+        if item.get("em_estoque") is False:
+            item = self.item_sem_estoque(item)
+        else:
+            item = self.apply_price_rules(item)
 
         self.logger.info(
-            "PDP FINAL | EAN=%s | nome=%s | preco=%s | precoPor=%s | precoDe=%s | oferta=%s | link=%s",
-            item["ean"], item["nome"], item["preco"], item["precoPor"], item["precoDe"], item["oferta"], item["link"]
+            "PDP FINAL | EAN=%s | nome=%s | preco=%s | precoPor=%s | precoDe=%s | oferta=%s | em_estoque=%s | link=%s",
+            item["ean"], item["nome"], item["preco"], item["precoPor"], item["precoDe"], item["oferta"], item.get("em_estoque"), item["link"]
         )
 
         yield item

@@ -2,26 +2,17 @@ import csv
 import json
 import re
 import unicodedata
-from ast import literal_eval
 from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import quote
-
 
 import scrapy
 from openpyxl import load_workbook
 
 
-
 class CotodigitalMkSpider(scrapy.Spider):
     name = "cotodigital_mk"
-    allowed_domains = [
-        "api.coto.com.ar",
-        "www.cotodigital.com.ar",
-        "cotodigital.com.ar",
-        "ac.cnstrc.com",
-    ]
-
+    allowed_domains = ["ac.cnstrc.com"]
 
     custom_settings = {
         "ROBOTSTXT_OBEY": False,
@@ -41,13 +32,14 @@ class CotodigitalMkSpider(scrapy.Spider):
             "preco_de_coto",
             "oferta_coto",
             "preco_referencia_coto",
+            "desconto_percentual_coto",
+            "tipo_oferta_coto",
             "sku_coto",
             "url_produto",
             "imagem",
             "search_url",
         ],
     }
-
 
     HEADER_ALIASES = {
         "articulo nr": "Artículo NR",
@@ -74,848 +66,310 @@ class CotodigitalMkSpider(scrapy.Spider):
         "competidor": "eCompetidor",
     }
 
-
-    REQUIRED_SEARCH_COLUMNS = {"Artículo DESCRIPCION", "EAN"}
-
-
     def __init__(self, input_file=None, store_id="200", sheet_name=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.input_file = input_file or "input.csv"
         self.store_id = str(store_id)
         self.sheet_name = sheet_name
         self.api_key = "key_r6xzz4IAoTWcipni"
-        self.rows = []
-
-
-    # =========================
-    # INÍCIO DO FLUXO SCRAPY
-    # =========================
-
 
     async def start(self):
-        self.rows = self.load_input_rows(self.input_file, self.sheet_name)
-        self.logger.info(f"[START] Linhas carregadas: {len(self.rows)} | arquivo={self.input_file}")
-
-
-        if self.rows:
-            self.logger.info(f"[DEBUG] Primeira linha normalizada: {self.rows[0]}")
-
-
-        self.rows = self.filter_rows_by_competitor(self.rows, target="Coto Ciudadela")
-        self.logger.info(
-            f"[FILTER] Linhas após filtro eCompetidor='Coto Ciudadela': {len(self.rows)}"
+        rows = self.filter_rows_by_competitor(
+            self.load_input_rows(self.input_file, self.sheet_name),
+            target="Coto Ciudadela",
         )
 
-
         headers = {
-            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Accept": "application/json, text/plain, */*",
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/137.0.0.0 Safari/537.36"
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
             ),
             "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
             "Referer": "https://www.cotodigital.com.ar/",
             "Origin": "https://www.cotodigital.com.ar",
         }
 
+        for row in rows:
+            descricao = self.clean_text(row.get("Artículo DESCRIPCION"))
+            ean = self.clean_ean(row.get("EAN"))
 
-        for idx, row in enumerate(self.rows, start=1):
-            articulo_nr = self.clean_text(row.get("Artículo NR", ""))
-            descripcion = self.clean_text(row.get("Artículo DESCRIPCION", ""))
-            ean = self.clean_ean(row.get("EAN", ""))
-
-
-            if idx <= 5:
-                self.logger.info(
-                    f"[ROW {idx}] articulo_nr={articulo_nr} | descricao={descripcion[:80]} | ean={ean}"
-                )
-
-
-            termos = []
             if ean:
-                termos.append(("ean", ean))
-            if descripcion:
-                termos.append(("descripcion", descripcion))
-
-
-            if not termos:
-                yield self.build_empty_item(
-                    row=row,
-                    erro="Linha sem EAN e sem descrição para busca."
-                )
+                query = ean
+                query_type = "ean"
+            elif descricao:
+                query = descricao
+                query_type = "descripcion"
+            else:
+                yield self.build_empty_item(row, erro="Linha sem EAN e sem descrição.")
                 continue
 
-
-            busca_tipo, termo = termos[0]
-            url = self.build_search_url(termo)
-
-
-            self.logger.info(
-                f"[SEARCH] tipo={busca_tipo} | termo={termo} | artigo_nr={articulo_nr}"
-            )
-
-
             yield scrapy.Request(
-                url=url,
+                url=self.build_search_url(query),
                 callback=self.parse_search,
                 errback=self.errback_search,
                 dont_filter=True,
                 headers=headers,
                 meta={
                     "row": row,
+                    "query": query,
+                    "query_type": query_type,
                     "headers_used": headers,
-                    "search_attempt_index": 0,
-                    "search_terms": termos,
-                    "search_tipo": busca_tipo,
-                    "search_termo": termo,
                 },
             )
 
+    def build_search_url(self, query):
+        q = quote(self.clean_text(query), safe="")
+        return (
+            "https://ac.cnstrc.com/search/"
+            f"{q}"
+            f"?c=cio-ui-autocomplete-1.29.3"
+            f"&key={self.api_key}"
+            f"&i=client-generated"
+            f"&s=22"
+            f"&num_results_per_page=24"
+            f"&page=1"
+            f"&fmt_options[hidden_fields]=price,discounts,product_brand,product_main_ean,sku_id,sku_plu,url,image_url,product_large_image_url,product_list_price,sale_type,groups,store_availability,sku_description,sku_display_name"
+        )
 
     def parse_search(self, response):
         row = response.meta["row"]
-        headers = response.meta["headers_used"]
-        search_attempt_index = response.meta["search_attempt_index"]
-        search_terms = response.meta["search_terms"]
-        search_tipo = response.meta["search_tipo"]
-        search_termo = response.meta["search_termo"]
-
-
-        self.logger.info(
-            f"[SEARCH_RESPONSE] status={response.status} | tipo={search_tipo} | termo={search_termo}"
-        )
-
-
-        data = response.json()
-        response_data = data.get("response", {}) or {}
-        results = response_data.get("results", []) or []
-        results = results[:10]
-
-
+        data = response.json().get("response", {}) or {}
+        results = data.get("results", []) or []
         best = self.choose_best_result(row, results)
 
-
-        if best:
-            data_map = self.extract_result_fields(best)
-
-
-            raw_preco = data_map.get("preco", "")
-            raw_ref = data_map.get("preco_referencia", "")
-
-
-            preco_coto_raw = self._simplificar_preco_saida(raw_preco, prefer="formatPrice")
-            preco_ref_raw = self._simplificar_preco_saida(raw_ref, prefer="listPrice")
-
-
-            precos_norm = self.normalize_prices_coto(
-                preco=preco_coto_raw,
-                preco_por=preco_coto_raw,
-                preco_de=preco_ref_raw,
-            )
-
-
-            self.logger.info(
-                f"[DEBUG_PRECO_FINAL] store_id={self.store_id} | "
-                f"preco_final={precos_norm['preco']} | preco_por={precos_norm['preco_por']} | "
-                f"preco_de={precos_norm['preco_de']} | oferta={precos_norm['oferta']}"
-            )
-
-
-            yield {
-                "articulo_nr": row.get("Artículo NR", ""),
-                "articulo_descripcion": row.get("Artículo DESCRIPCION", ""),
-                "ean_entrada": row.get("EAN", ""),
-                "area": row.get("AREA", ""),
-                "marca_coto": data_map.get("marca", ""),
-                "preco_por_coto": precos_norm["preco_por"],
-                "preco_de_coto": precos_norm["preco_de"],
-                "oferta_coto": precos_norm["oferta"],
-                "preco_referencia_coto": preco_ref_raw,
-                "sku_coto": data_map.get("sku", ""),
-                "url_produto": data_map.get("url", ""),
-                "imagem": data_map.get("imagem", ""),
-                "search_url": response.url,
-            }
-            return
-
-
-        next_attempt = search_attempt_index + 1
-        if next_attempt < len(search_terms):
-            novo_tipo, novo_termo = search_terms[next_attempt]
-            nova_url = self.build_search_url(novo_termo)
-
-
-            self.logger.info(
-                f"[RETRY_SEARCH] tipo={novo_tipo} | termo={novo_termo} | artigo_nr={row.get('Artículo NR', '')}"
-            )
-
-
-            yield scrapy.Request(
-                url=nova_url,
-                callback=self.parse_search,
-                errback=self.errback_search,
-                dont_filter=True,
-                headers=headers,
-                meta={
-                    "row": row,
-                    "headers_used": headers,
-                    "search_attempt_index": next_attempt,
-                    "search_terms": search_terms,
-                    "search_tipo": novo_tipo,
-                    "search_termo": novo_termo,
-                },
+        if not best:
+            yield self.build_empty_item(
+                row=row,
+                busca_tipo=response.meta.get("query_type", ""),
+                busca_termo=response.meta.get("query", ""),
+                search_url=response.url,
+                total_resultados=data.get("total_num_results", 0),
+                erro="Nenhum resultado compatível encontrado.",
             )
             return
 
-
-        yield self.build_empty_item(
-            row=row,
-            busca_tipo=search_tipo,
-            busca_termo=search_termo,
-            search_url=response.url,
-            total_resultados=response_data.get("total_num_results", 0),
-            erro="Nenhum resultado compatível encontrado."
-        )
-
+        data_map = self.extract_result_fields(best)
+        em_estoque = self.is_available_result(best)
+        yield self.build_final_item_from_search(row, response, data_map, em_estoque)
 
     def errback_search(self, failure):
-        request = getattr(failure, "request", None)
-        row = request.meta.get("row", {}) if request else {}
-        search_tipo = request.meta.get("search_tipo", "") if request else ""
-        search_termo = request.meta.get("search_termo", "") if request else ""
-
-
+        req = getattr(failure, "request", None)
+        row = req.meta.get("row", {}) if req else {}
         yield self.build_empty_item(
             row=row,
-            busca_tipo=search_tipo,
-            busca_termo=search_termo,
-            search_url=request.url if request else "",
-            total_resultados="",
+            busca_tipo=req.meta.get("query_type", "") if req else "",
+            busca_termo=req.meta.get("query", "") if req else "",
+            search_url=req.url if req else "",
             erro=repr(failure.value),
         )
 
-
-    def build_search_url(self, termo):
-        termo = self.clean_text(termo)
-        termo_enc = quote(termo, safe="")
-        pre_filter = quote(
-            json.dumps({"name": "store_availability", "value": self.store_id}, separators=(",", ":")),
-            safe=""
-        )
-        return (
-            "https://api.coto.com.ar/api/v1/ms-digital-sitio-bff-web/api/v1/products/search/"
-            f"{termo_enc}?key={self.api_key}&num_results_per_page=24&pre_filter_expression={pre_filter}"
-        )
-
-
-    def filter_rows_by_competitor(self, rows, target="Coto Ciudadela"):
-        target_norm = self.normalize_text(target)
-        filtered = []
-
-
-        for row in rows:
-            competitor = row.get("eCompetidor", "")
-            if self.normalize_text(competitor) == target_norm:
-                filtered.append(row)
-
-
-        return filtered
-
-
-    # =========================
-    # ESCOLHA DO MELHOR RESULT
-    # =========================
-
-
     def choose_best_result(self, row, results):
-        ean_entrada = self.clean_ean(row.get("EAN", ""))
-        desc_entrada = self.normalize_text(row.get("Artículo DESCRIPCION", ""))
-        area_entrada = self.normalize_text(row.get("AREA", ""))
-        main_group_entrada = self.normalize_text(row.get("MAIN GROUP", ""))
-        grupo_entrada = self.normalize_text(row.get("GRUPO", ""))
-
+        ean_entrada = self.clean_ean(row.get("EAN"))
+        desc_entrada = self.normalize_text(row.get("Artículo DESCRIPCION"))
+        categorias_entrada = " ".join(
+            x for x in [
+                self.normalize_text(row.get("AREA")),
+                self.normalize_text(row.get("MAIN GROUP")),
+                self.normalize_text(row.get("GRUPO")),
+            ] if x
+        )
 
         best = None
         best_score = -1
 
-
         for result in results:
-            data_map = self.extract_result_fields(result)
+            d = self.extract_result_fields(result)
+            nome = self.normalize_text(d.get("nome"))
+            marca = self.normalize_text(d.get("marca"))
+            ean_result = self.clean_ean(d.get("ean"))
+            sku_result = self.clean_text(d.get("sku"))
 
-
-            nome = self.normalize_text(data_map.get("nome", ""))
-            marca = self.normalize_text(data_map.get("marca", ""))
-            categoria_texto = " ".join(
-                x for x in [
-                    self.normalize_text(result.get("data", {}).get("AREA", "")),
-                    self.normalize_text(result.get("data", {}).get("MAIN GROUP", "")),
-                    self.normalize_text(result.get("data", {}).get("GRUPO", "")),
-                ] if x
-            )
-
-
-            ean_result = self.clean_ean(data_map.get("ean", ""))
-            sku_result = self.clean_text(data_map.get("sku", ""))
-
+            group_names = []
+            for g in (result.get("data", {}) or {}).get("groups", []) or []:
+                group_names.append(self.normalize_text(g.get("display_name")))
+            categoria_result = " ".join(x for x in group_names if x)
 
             score = 0
-
 
             if ean_entrada and ean_result and ean_entrada == ean_result:
                 score += 100
 
-
             if ean_entrada and sku_result and ean_entrada in sku_result:
-                score += 20
-
+                score += 15
 
             if desc_entrada and nome:
                 score += int(100 * SequenceMatcher(None, desc_entrada, nome).ratio())
 
+            if categorias_entrada and categoria_result:
+                score += int(30 * SequenceMatcher(None, categorias_entrada, categoria_result).ratio())
 
-            if desc_entrada and marca and marca in desc_entrada:
+            if marca and desc_entrada and marca in desc_entrada:
                 score += 10
 
-
-            categorias_entrada = " ".join(x for x in [area_entrada, main_group_entrada, grupo_entrada] if x)
-            if categorias_entrada and categoria_texto:
-                score += int(30 * SequenceMatcher(None, categorias_entrada, categoria_texto).ratio())
-
-
-            result["_score_match"] = score
-
-
             if score > best_score:
-                best_score = score
                 best = result
-
-
-        if best is not None:
-            best["_score_match"] = best_score
-
+                best_score = score
 
         return best
-
-
-    # =========================
-    # FILTRO DE PREÇO
-    # =========================
-
-
-    def _extrair_format_price_de_raw(self, raw_prices):
-        if not raw_prices:
-            return "", ""
-
-
-        if isinstance(raw_prices, list):
-            preco_list = raw_prices
-        elif isinstance(raw_prices, str):
-            try:
-                preco_list = literal_eval(raw_prices)
-            except Exception:
-                preco_list = []
-        elif isinstance(raw_prices, dict):
-            preco_list = [raw_prices]
-        else:
-            try:
-                preco_list = list(raw_prices)
-            except Exception:
-                preco_list = []
-
-
-        if not preco_list:
-            return "", ""
-
-
-        store_target = self.store_id.zfill(3)
-        chosen = None
-
-
-        for p in preco_list:
-            if not isinstance(p, dict):
-                continue
-            store = str(p.get("store", "")).zfill(3)
-            if store == store_target:
-                chosen = p
-                break
-
-
-        if chosen is None:
-            for p in preco_list:
-                if isinstance(p, dict) and (
-                    p.get("formatPrice") is not None or p.get("listPrice") is not None
-                ):
-                    chosen = p
-                    break
-
-
-        if chosen is None or not isinstance(chosen, dict):
-            return "", ""
-
-
-        format_price = chosen.get("formatPrice")
-        list_price = chosen.get("listPrice")
-
-
-        preco = ""
-        preco_referencia = ""
-
-
-        if format_price not in (None, ""):
-            preco = str(format_price)
-
-
-        if list_price not in (None, ""):
-            preco_referencia = str(list_price)
-
-
-        return preco, preco_referencia
-
-
-    def _simplificar_preco_saida(self, valor, prefer="formatPrice"):
-        if valor in (None, ""):
-            return ""
-
-
-        if isinstance(valor, (int, float)):
-            if isinstance(valor, float) and valor.is_integer():
-                return str(int(valor))
-            return str(valor)
-
-
-        if isinstance(valor, dict):
-            if prefer == "listPrice":
-                return str(valor.get("listPrice") or valor.get("formatPrice") or "")
-            return str(valor.get("formatPrice") or valor.get("listPrice") or "")
-
-
-        parsed = valor
-        if isinstance(valor, str):
-            texto = valor.strip()
-            try:
-                parsed = literal_eval(texto)
-            except Exception:
-                return texto
-
-
-        if isinstance(parsed, list) and parsed:
-            loja_alvo = str(self.store_id).zfill(3)
-            escolhido = None
-
-
-            for p in parsed:
-                if isinstance(p, dict) and str(p.get("store", "")).zfill(3) == loja_alvo:
-                    escolhido = p
-                    break
-
-
-            if escolhido is None:
-                for p in parsed:
-                    if isinstance(p, dict):
-                        escolhido = p
-                        break
-
-
-            if not isinstance(escolhido, dict):
-                return ""
-
-
-            if prefer == "listPrice":
-                return str(escolhido.get("listPrice") or escolhido.get("formatPrice") or "")
-            return str(escolhido.get("formatPrice") or escolhido.get("listPrice") or "")
-
-
-        if isinstance(parsed, dict):
-            if prefer == "listPrice":
-                return str(parsed.get("listPrice") or parsed.get("formatPrice") or "")
-            return str(parsed.get("formatPrice") or parsed.get("listPrice") or "")
-
-
-        return str(parsed).strip()
-
-
-    def _to_float(self, valor):
-        if valor in (None, ""):
-            return None
-        if isinstance(valor, (int, float)):
-            return float(valor)
-
-
-        texto = str(valor).strip()
-        texto = texto.replace("$", "").replace("\xa0", " ")
-        texto = texto.replace(".", "").replace(",", ".")
-        texto = re.sub(r"[^\d.]", "", texto)
-
-
-        try:
-            return float(texto) if texto else None
-        except Exception:
-            return None
-
-
-    def normalize_prices_coto(self, preco=None, preco_por=None, preco_de=None):
-        preco = self._to_float(preco)
-        preco_por = self._to_float(preco_por)
-        preco_de = self._to_float(preco_de)
-
-
-        if preco is None:
-            preco = preco_por if preco_por is not None else preco_de
-
-
-        if preco_por is not None and preco_de is not None and preco_de > preco_por:
-            return {
-                "preco": preco_por,
-                "preco_por": preco_por,
-                "preco_de": preco_de,
-                "oferta": "x",
-            }
-
-
-        preco_final = preco if preco is not None else preco_por if preco_por is not None else preco_de
-
-
-        return {
-            "preco": preco_final,
-            "preco_por": None,
-            "preco_de": None,
-            "oferta": None,
-        }
-
 
     def extract_result_fields(self, result):
         data = result.get("data", {}) or {}
+        store_price = self._get_store_price_from_result(data, self.store_id)
+        discount = self._get_first_discount(data)
 
+        preco_por = ""
+        preco_de = ""
+        desconto_percentual = ""
+        tipo_oferta = ""
 
-        imagem = ""
-        image_url = data.get("image_url")
-        image_urls = data.get("image_urls")
-        if image_url:
-            imagem = image_url
-        elif isinstance(image_urls, list) and image_urls:
-            imagem = image_urls[0]
+        if discount:
+            preco_por = discount.get("discountPrice") or ""
+            preco_de = self._extract_number_from_text(discount.get("regularPriceText") or "")
+            tipo_oferta = discount.get("discountText") or ""
+            desconto_percentual = self.extract_only_percentage(tipo_oferta)
 
+        if not preco_por and store_price:
+            preco_por = store_price.get("formatPrice") or ""
 
-        raw_prices = (
-            data.get("price")
-            or data.get("prices")
-            or data.get("price_list")
-            or data.get("priceList")
-            or data.get("storePrices")
-        )
+        if not preco_de and store_price:
+            preco_de = store_price.get("listPrice") or ""
 
+        if not tipo_oferta:
+            sale_type = data.get("sale_type") or []
+            if isinstance(sale_type, list):
+                tipo_oferta = " ".join(str(x) for x in sale_type if x)
+            else:
+                tipo_oferta = str(sale_type or "")
+            if not desconto_percentual:
+                desconto_percentual = self.extract_only_percentage(tipo_oferta)
 
-        preco, preco_referencia = self._extrair_format_price_de_raw(raw_prices)
-
-
-        if not preco:
-            raw_p = data.get("price") or data.get("current_price") or ""
-            if raw_p not in (None, ""):
-                preco = self._simplificar_preco_saida(raw_p, prefer="formatPrice")
-
-
-        if not preco_referencia:
-            raw_pr = (
-                data.get("list_price")
-                or data.get("original_price")
-                or data.get("reference_price")
-                or ""
-            )
-            if raw_pr not in (None, ""):
-                preco_referencia = self._simplificar_preco_saida(raw_pr, prefer="listPrice")
-
-
-        nome = (
-            data.get("sku_display_name")
-            or data.get("product_name")
-            or data.get("name")
-            or result.get("value", "")
+        imagem = (
+            data.get("image_url")
+            or data.get("product_large_image_url")
+            or data.get("product_medium_image_url")
             or ""
         )
-
-
-        marca = (
-            data.get("brand")
-            or data.get("product_brand")
-            or data.get("brand_name")
-            or ""
-        )
-
-
-        ean = (
-            data.get("ean")
-            or data.get("gtin")
-            or data.get("barcode")
-            or ""
-        )
-
-
-        sku = (
-            data.get("sku")
-            or data.get("id")
-            or result.get("id", "")
-            or ""
-        )
-
-
-        url = (
-            data.get("url")
-            or data.get("product_url")
-            or ""
-        )
-
 
         return {
-            "nome": nome,
-            "marca": marca,
-            "preco": preco,
-            "preco_referencia": preco_referencia,
-            "ean": ean,
-            "sku": sku,
-            "url": url,
+            "nome": data.get("sku_display_name") or data.get("sku_description") or result.get("value", "") or "",
+            "marca": data.get("product_brand") or "",
+            "preco": preco_por,
+            "preco_referencia": preco_de,
+            "desconto_percentual": desconto_percentual,
+            "tipo_oferta": tipo_oferta,
+            "ean": data.get("product_main_ean") or "",
+            "sku": data.get("sku_id") or data.get("sku_plu") or "",
+            "url": data.get("url") or "",
             "imagem": imagem,
         }
 
-
-    # =========================
-    # LEITURA DE INPUT (CSV/XLSX)
-    # =========================
-
-
-    def load_input_rows(self, file_path, sheet_name=None):
-        path = Path(file_path)
-
-
-        if not path.is_absolute():
-            candidates = [
-                Path.cwd() / path,
-                Path(__file__).resolve().parent / path,
-                Path(__file__).resolve().parent.parent / path,
-                Path(__file__).resolve().parent.parent.parent / path,
-            ]
-            found = next((p for p in candidates if p.exists()), None)
-            if found:
-                path = found
-
-
-        if not path.exists():
-            raise FileNotFoundError(
-                f"Arquivo não encontrado: {file_path} | cwd={Path.cwd()}"
-            )
-
-
-        suffix = path.suffix.lower()
-
-
-        if suffix == ".csv":
-            return self.load_csv_rows(path)
-
-
-        if suffix in [".xlsx", ".xlsm"]:
-            return self.load_xlsx_rows(path, sheet_name)
-
-
-        raise ValueError(f"Extensão não suportada: {suffix}")
-
-
-    def load_csv_rows(self, path):
-        with open(path, "r", encoding="utf-8-sig", newline="") as f:
-            reader = csv.reader(f)
-            all_rows = list(reader)
-
-
-        if not all_rows:
-            return []
-
-
-        header_idx = self.find_header_row_index(all_rows)
-        headers = [self.map_header_name(h) for h in all_rows[header_idx]]
-        self.logger.info(f"[CSV] Header row index: {header_idx}")
-        self.logger.info(f"[CSV] Headers mapeados: {headers}")
-
-
-        output = []
-        for raw_values in all_rows[header_idx + 1:]:
-            if not raw_values or all(not self.clean_text(v) for v in raw_values):
-                continue
-
-
-            row = {}
-            for idx, header in enumerate(headers):
-                if not header:
-                    continue
-                value = raw_values[idx] if idx < len(raw_values) else ""
-                row[header] = self.clean_cell_value(value)
-
-
-            output.append(row)
-
-
-        return output
-
-
-    def load_xlsx_rows(self, path, sheet_name=None):
-        wb = load_workbook(filename=path, read_only=True, data_only=True)
-
-
-        try:
-            if sheet_name and sheet_name in wb.sheetnames:
-                ws = wb[sheet_name]
-            else:
-                ws = self.choose_best_sheet(wb)
-
-
-            self.logger.info(f"[XLSX] Aba usada: {ws.title}")
-
-
-            all_rows = []
-            for row in ws.iter_rows(values_only=True):
-                all_rows.append([self.clean_cell_value(cell) for cell in row])
-
-
-            if not all_rows:
-                return []
-
-
-            header_idx = self.find_header_row_index(all_rows)
-            raw_headers = all_rows[header_idx]
-            mapped_headers = [self.map_header_name(h) for h in raw_headers]
-
-
-            self.logger.info(f"[XLSX] Header row index: {header_idx}")
-            self.logger.info(f"[XLSX] Headers brutos: {raw_headers}")
-            self.logger.info(f"[XLSX] Headers mapeados: {mapped_headers}")
-
-
-            output = []
-            for raw_values in all_rows[header_idx + 1:]:
-                if not raw_values or all(not self.clean_text(v) for v in raw_values):
-                    continue
-
-
-                row = {}
-                for idx, header in enumerate(mapped_headers):
-                    if not header:
-                        continue
-                    value = raw_values[idx] if idx < len(raw_values) else ""
-                    row[header] = self.clean_cell_value(value)
-
-
-                if any(self.clean_text(v) for v in row.values()):
-                    output.append(row)
-
-
-            return output
-        finally:
-            wb.close()
-
-
-    def choose_best_sheet(self, workbook):
-        best_ws = workbook[workbook.sheetnames[0]]
-        best_score = -1
-
-
-        for sheet_name in workbook.sheetnames:
-            ws = workbook[sheet_name]
-
-
-            preview_rows = []
-            for i, row in enumerate(ws.iter_rows(values_only=True)):
-                if i >= 15:
-                    break
-                preview_rows.append([self.clean_cell_value(cell) for cell in row])
-
-
-            score = self.score_sheet(preview_rows)
-            self.logger.info(f"[XLSX] Score aba '{ws.title}': {score}")
-
-
-            if score > best_score:
-                best_score = score
-                best_ws = ws
-
-
-        return best_ws
-
-
-    def score_sheet(self, rows):
-        best = 0
-        for row in rows[:15]:
-            normalized = [self.normalize_header(v) for v in row if self.clean_text(v)]
-            score = 0
-            for col in normalized:
-                if col in self.HEADER_ALIASES:
-                    score += 1
-            best = max(best, score)
-        return best
-
-
-    def find_header_row_index(self, rows):
-        best_index = 0
-        best_score = -1
-        max_rows = min(len(rows), 20)
-
-
-        for idx in range(max_rows):
-            row = rows[idx]
-            normalized = [self.normalize_header(v) for v in row if self.clean_text(v)]
-
-
-            score = 0
-            found_mapped = set()
-
-
-            for col in normalized:
-                mapped = self.HEADER_ALIASES.get(col)
-                if mapped:
-                    score += 1
-                    found_mapped.add(mapped)
-
-
-            if "EAN" in found_mapped:
-                score += 2
-            if "Artículo DESCRIPCION" in found_mapped:
-                score += 2
-
-
-            if score > best_score:
-                best_score = score
-                best_index = idx
-
-
-        self.logger.info(f"[HEADER] Linha escolhida como cabeçalho: {best_index} | score={best_score}")
-        return best_index
-
-
-    def map_header_name(self, header):
-        normalized = self.normalize_header(header)
-        return self.HEADER_ALIASES.get(normalized, self.clean_text(header))
-
-
-    def normalize_header(self, value):
-        value = self.clean_text(value)
-        value = value.replace("\n", " ").replace("\r", " ").replace("_", " ")
-        value = re.sub(r"\s+", " ", value).strip().lower()
-        value = unicodedata.normalize("NFKD", value)
-        value = "".join(ch for ch in value if not unicodedata.combining(ch))
-        return value
-
-
-    # =========================
-    # ITENS VAZIOS / LIMPEZA
-    # =========================
-
-
-    def build_empty_item(
-        self,
-        row,
-        busca_tipo="",
-        busca_termo="",
-        search_url="",
-        total_resultados="",
-        erro="",
-    ):
+    def build_final_item_from_search(self, row, response, data_map, em_estoque=True):
+        preco_destaque = self._format_output_price(data_map.get("preco"))
+        preco_ref = self._format_output_price(data_map.get("preco_referencia"))
+        desconto = data_map.get("desconto_percentual")
+        tipo_oferta = self.extract_only_percentage(data_map.get("tipo_oferta"))
+
+        if not tipo_oferta and desconto not in (None, ""):
+            tipo_oferta = f"{str(desconto).replace('.0', '')}%"
+
+        if not em_estoque:
+            preco_destaque = ""
+            preco_ref = ""
+            desconto = ""
+            tipo_oferta = ""
+
+        oferta_coto = "x" if tipo_oferta else ""
+        preco_por_coto = preco_destaque if tipo_oferta else ""
+
+        return {
+            "articulo_nr": row.get("Artículo NR", ""),
+            "articulo_descripcion": row.get("Artículo DESCRIPCION", ""),
+            "ean_entrada": row.get("EAN", ""),
+            "area": row.get("AREA", ""),
+            "marca_coto": data_map.get("marca", ""),
+            "preco_por_coto": preco_por_coto,
+            "preco_de_coto": preco_ref,
+            "oferta_coto": oferta_coto,
+            "preco_referencia_coto": preco_ref,
+            "desconto_percentual_coto": desconto if desconto not in (None, "") else "",
+            "tipo_oferta_coto": tipo_oferta,
+            "sku_coto": data_map.get("sku", ""),
+            "url_produto": self.make_absolute_product_url(data_map.get("url", "")),
+            "imagem": data_map.get("imagem", ""),
+            "search_url": getattr(response, "url", ""),
+        }
+
+    def is_available_result(self, result):
+        data = result.get("data", {}) or {}
+        stores = data.get("store_availability") or []
+        target = self.store_id.zfill(3)
+
+        if isinstance(stores, list):
+            return target in [str(x).zfill(3) for x in stores]
+
+        return True
+
+    def _get_store_price_from_result(self, data, store_id):
+        prices = data.get("price") or []
+        target = str(store_id).zfill(3)
+
+        for p in prices:
+            if str(p.get("store", "")).zfill(3) == target:
+                return p
+
+        return prices[0] if prices else {}
+
+    def _get_first_discount(self, data):
+        discounts = data.get("discounts") or []
+        return discounts[0] if discounts else {}
+
+    def _extract_number_from_text(self, text):
+        text = str(text or "")
+        m = re.search(r'(\d+(?:[.,]\d{1,2})?)', text.replace(".", "").replace(",", "."))
+        return m.group(1) if m else ""
+
+    def _format_output_price(self, value):
+        if value in (None, "", [], {}):
+            return ""
+        if isinstance(value, int):
+            return str(value)
+        if isinstance(value, float):
+            return str(int(value)) if value.is_integer() else str(value)
+        return str(value).strip()
+
+    def extract_only_percentage(self, value):
+        texto = self.clean_text(value)
+        if not texto:
+            return ""
+
+        m = re.search(r"(\d+(?:[.,]\d+)?)\s*%", texto)
+        if m:
+            numero = m.group(1).replace(",", ".")
+            if numero.endswith(".0"):
+                numero = numero[:-2]
+            return f"{numero}%"
+
+        m = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:dto|descuento)", texto, re.I)
+        if m:
+            numero = m.group(1).replace(",", ".")
+            if numero.endswith(".0"):
+                numero = numero[:-2]
+            return f"{numero}%"
+
+        return ""
+
+    def make_absolute_product_url(self, url):
+        url = self.clean_text(url)
+        if not url:
+            return ""
+        if url.startswith(("http://", "https://")):
+            return url
+        if url.startswith("_/"):
+            return f"https://www.cotodigital.com.ar/sitios/cdigi/productos/{url}"
+        return f"https://www.cotodigital.com.ar{url}"
+    
+    def build_empty_item(self, row, busca_tipo="", busca_termo="", search_url="", total_resultados="", erro=""):
         return {
             "articulo_nr": row.get("Artículo NR", ""),
             "articulo_descripcion": row.get("Artículo DESCRIPCION", ""),
@@ -926,41 +380,139 @@ class CotodigitalMkSpider(scrapy.Spider):
             "preco_de_coto": "",
             "oferta_coto": "",
             "preco_referencia_coto": "",
+            "desconto_percentual_coto": "",
+            "tipo_oferta_coto": "",
             "sku_coto": "",
             "url_produto": "",
             "imagem": "",
             "search_url": search_url,
         }
 
+    def load_input_rows(self, file_path, sheet_name=None):
+        path = self.resolve_input_path(file_path)
+
+        if path.suffix.lower() == ".csv":
+            with open(path, "r", encoding="utf-8-sig", newline="") as f:
+                return self.rows_from_matrix(list(csv.reader(f)))
+
+        if path.suffix.lower() in [".xlsx", ".xlsm"]:
+            wb = load_workbook(filename=path, read_only=True, data_only=True)
+            try:
+                ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else self.choose_best_sheet(wb)
+                rows = [[self.clean_cell_value(c) for c in row] for row in ws.iter_rows(values_only=True)]
+                return self.rows_from_matrix(rows)
+            finally:
+                wb.close()
+
+        raise ValueError(f"Extensão não suportada: {path.suffix.lower()}")
+
+    def resolve_input_path(self, file_path):
+        path = Path(file_path)
+
+        if not path.is_absolute():
+            candidates = [
+                Path.cwd() / path,
+                Path(__file__).resolve().parent / path,
+                Path(__file__).resolve().parent.parent / path,
+                Path(__file__).resolve().parent.parent.parent / path,
+            ]
+            for candidate in candidates:
+                if candidate.exists():
+                    return candidate
+
+        if not path.exists():
+            raise FileNotFoundError(f"Arquivo não encontrado: {file_path} | cwd={Path.cwd()}")
+
+        return path
+
+    def rows_from_matrix(self, all_rows):
+        if not all_rows:
+            return []
+
+        header_idx = self.find_header_row_index(all_rows)
+        headers = [self.map_header_name(h) for h in all_rows[header_idx]]
+        out = []
+
+        for raw in all_rows[header_idx + 1:]:
+            row = {
+                h: self.clean_cell_value(raw[i] if i < len(raw) else "")
+                for i, h in enumerate(headers)
+                if h
+            }
+            if any(self.clean_text(v) for v in row.values()):
+                out.append(row)
+
+        return out
+
+    def choose_best_sheet(self, workbook):
+        best_ws = workbook[workbook.sheetnames[0]]
+        best_score = -1
+
+        for name in workbook.sheetnames:
+            ws = workbook[name]
+            preview = []
+            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                if i >= 15:
+                    break
+                preview.append([self.clean_cell_value(c) for c in row])
+
+            score = self.score_sheet(preview)
+            if score > best_score:
+                best_ws = ws
+                best_score = score
+
+        return best_ws
+
+    def score_sheet(self, rows):
+        best = 0
+        for row in rows[:15]:
+            normalized = [self.normalize_header(v) for v in row if self.clean_text(v)]
+            best = max(best, sum(1 for col in normalized if col in self.HEADER_ALIASES))
+        return best
+
+    def find_header_row_index(self, rows):
+        best_idx = 0
+        best_score = -1
+
+        for idx in range(min(len(rows), 20)):
+            normalized = [self.normalize_header(v) for v in rows[idx] if self.clean_text(v)]
+            found = {self.HEADER_ALIASES[col] for col in normalized if col in self.HEADER_ALIASES}
+            score = len(found) + (2 if "EAN" in found else 0) + (2 if "Artículo DESCRIPCION" in found else 0)
+            if score > best_score:
+                best_idx = idx
+                best_score = score
+
+        return best_idx
+
+    def map_header_name(self, header):
+        return self.HEADER_ALIASES.get(self.normalize_header(header), self.clean_text(header))
+
+    def filter_rows_by_competitor(self, rows, target="Coto Ciudadela"):
+        target_norm = self.normalize_text(target)
+        return [r for r in rows if self.normalize_text(r.get("eCompetidor")) == target_norm]
 
     def clean_cell_value(self, value):
         if value is None:
             return ""
         if isinstance(value, float):
-            if value.is_integer():
-                return str(int(value))
-            return str(value)
+            return str(int(value)) if value.is_integer() else str(value)
         return str(value).strip()
-
 
     def clean_text(self, value):
-        if value is None:
-            return ""
-        return str(value).strip()
-
+        return "" if value is None else str(value).strip()
 
     def clean_ean(self, value):
-        if value is None:
-            return ""
-        value = str(value).strip()
-        digits = re.sub(r"\D+", "", value)
-        return digits
+        return "" if value is None else re.sub(r"\D+", "", str(value).strip())
 
+    def normalize_header(self, value):
+        value = self.clean_text(value).replace("\n", " ").replace("\r", " ").replace("_", " ")
+        value = re.sub(r"\s+", " ", value).strip().lower()
+        value = unicodedata.normalize("NFKD", value)
+        return "".join(ch for ch in value if not unicodedata.combining(ch))
 
     def normalize_text(self, value):
         value = self.clean_text(value).lower()
         value = unicodedata.normalize("NFKD", value)
         value = "".join(ch for ch in value if not unicodedata.combining(ch))
         value = re.sub(r"[^a-z0-9\s]", " ", value, flags=re.IGNORECASE)
-        value = re.sub(r"\s+", " ", value).strip()
-        return value
+        return re.sub(r"\s+", " ", value).strip()
